@@ -35,14 +35,28 @@
 # OpenVINO's GPU plugin above can never use one. It runs YOLOV5 through ONNX
 # Runtime's CUDA execution provider instead of OpenVINO, using a .onnx
 # sibling of assets/yolov5.xml (same weights, converted offline -- see
-# JETSON_ORIN.md). x86_64 only here too: this installs a generic x86_64 CUDA
-# runtime, which is NOT what Jetson needs (Jetson requires JetPack/L4T's own
-# CUDA build tied to its embedded driver) -- so this path is for the NVIDIA
-# GPU on an x86_64 dev machine, not Jetson. At container run time NVIDIA
-# access on Windows/WSL2 comes through the same `--device=/dev/dxg
-# -v /usr/lib/wsl:/usr/lib/wsl` as the Intel path above (Docker Desktop
-# mirrors both vendors' driver shims there); on native Linux use `--gpus all`
-# (needs the NVIDIA Container Toolkit installed on the host).
+# JETSON_ORIN.md). Both x86_64 (NVIDIA dev-machine GPU) and aarch64 (Jetson's
+# own GPU) are supported, but via two completely different installs, because
+# desktop CUDA and Jetson/JetPack CUDA are different builds:
+#   - x86_64: a generic CUDA 12.6 runtime is apt-installed straight into the
+#     image from NVIDIA's desktop repo, paired with the generic
+#     onnxruntime-linux-x64-gpu release.
+#   - aarch64 (Jetson): CUDA/cuDNN/TensorRT are NOT installed into the image
+#     at all -- they already exist on the Jetson host (via JetPack) tied
+#     exactly to its flashed L4T version, and get bind-mounted into the
+#     container at `docker run --runtime nvidia` time by the NVIDIA
+#     Container Runtime (see JETSON_ORIN.md §5.6). Only ONNX Runtime's own
+#     libs go into the image here, built for aarch64+Jetson specifically
+#     (the generic aarch64 onnxruntime-gpu wheel on PyPI doesn't support
+#     Tegra, so this uses a community-built Jetson wheel instead); the
+#     matching public C++ headers are pulled straight from the onnxruntime
+#     GitHub repo at the same version tag, since prebuilt wheels don't ship
+#     C/C++ headers.
+# At container run time NVIDIA access on Windows/WSL2 comes through the same
+# `--device=/dev/dxg -v /usr/lib/wsl:/usr/lib/wsl` as the Intel path above
+# (Docker Desktop mirrors both vendors' driver shims there); on native Linux
+# x86_64 use `--gpus all` (needs the NVIDIA Container Toolkit); on Jetson use
+# `--runtime nvidia -e NVIDIA_VISIBLE_DEVICES=all` (see JETSON_ORIN.md §5.6).
 
 FROM ubuntu:22.04
 
@@ -110,12 +124,12 @@ RUN set -eux; \
     fi
 
 # --- NVIDIA CUDA runtime + ONNX Runtime GPU (needed for `device: CUDA`) ---
-# x86_64 only -- see note above. cuda-cudart/cublas/cufft/curand/cusparse/
-# cusolver + cudnn9 + nvrtc are the minimal runtime pieces ONNX Runtime's
-# CUDA execution provider needs (no nvcc/full toolkit required). Pinned to
-# CUDA 12.6 + cuDNN 9, the combination ONNX Runtime 1.20.x's GPU build
-# expects; the container only needs a driver new enough to run *some* CUDA
-# 12.x, which is what NVIDIA driver backward compatibility guarantees.
+# x86_64: cuda-cudart/cublas/cufft/curand/cusparse/cusolver + cudnn9 + nvrtc
+# are the minimal runtime pieces ONNX Runtime's CUDA execution provider
+# needs (no nvcc/full toolkit required). Pinned to CUDA 12.6 + cuDNN 9, the
+# combination ONNX Runtime 1.20.x's GPU build expects; the container only
+# needs a driver new enough to run *some* CUDA 12.x, which is what NVIDIA
+# driver backward compatibility guarantees.
 ARG ONNXRUNTIME_VERSION=1.20.1
 RUN set -eux; \
     if [ "$(uname -m)" = "x86_64" ]; then \
@@ -132,6 +146,32 @@ RUN set -eux; \
         mkdir -p /opt/onnxruntime; \
         tar -xzf /tmp/onnxruntime.tgz -C /opt/onnxruntime --strip-components=1; \
         rm /tmp/onnxruntime.tgz; \
+        echo /opt/onnxruntime/lib > /etc/ld.so.conf.d/onnxruntime.conf; \
+        ldconfig; \
+    fi
+
+# aarch64 (Jetson): no CUDA/cuDNN/TensorRT apt-install -- those come from the
+# host at `docker run --runtime nvidia` time (see note above). Just unpacks
+# ONNX Runtime's aarch64+CUDA+TensorRT libs from a community Jetson build
+# (JetPack 6.x / CUDA 12.6, matching what JETSON_ORIN.md's diagnostics found
+# on the reference device) and fetches the matching public C++ headers
+# directly from the onnxruntime source tree at the same version tag.
+ARG ONNXRUNTIME_JETSON_VERSION=1.23.0
+ARG ONNXRUNTIME_JETSON_WHEEL_URL=https://github.com/ultralytics/assets/releases/download/v0.0.0/onnxruntime_gpu-1.23.0-cp310-cp310-linux_aarch64.whl
+RUN set -eux; \
+    if [ "$(uname -m)" = "aarch64" ]; then \
+        apt-get update && apt-get install -y --no-install-recommends unzip; \
+        rm -rf /var/lib/apt/lists/*; \
+        wget -q "$ONNXRUNTIME_JETSON_WHEEL_URL" -O /tmp/onnxruntime.whl; \
+        mkdir -p /opt/onnxruntime/lib /opt/onnxruntime/include; \
+        unzip -q -j /tmp/onnxruntime.whl 'onnxruntime/capi/libonnxruntime*' -d /opt/onnxruntime/lib; \
+        rm /tmp/onnxruntime.whl; \
+        ln -sf "libonnxruntime.so.${ONNXRUNTIME_JETSON_VERSION}" /opt/onnxruntime/lib/libonnxruntime.so; \
+        for h in onnxruntime_c_api.h onnxruntime_cxx_api.h onnxruntime_cxx_inline.h \
+                 onnxruntime_ep_c_api.h onnxruntime_float16.h; do \
+            wget -q "https://raw.githubusercontent.com/microsoft/onnxruntime/v${ONNXRUNTIME_JETSON_VERSION}/include/onnxruntime/core/session/$h" \
+                -O "/opt/onnxruntime/include/$h"; \
+        done; \
         echo /opt/onnxruntime/lib > /etc/ld.so.conf.d/onnxruntime.conf; \
         ldconfig; \
     fi

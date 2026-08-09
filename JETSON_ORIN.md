@@ -107,19 +107,16 @@ component-by-component breakdown:
 | Serial (STM32 C-board, IMU) | ✅ Works | vendored `serial` lib is a plain POSIX termios wrapper |
 | OpenCV / Eigen / Ceres / fmt / spdlog / yaml-cpp / nlohmann-json | ✅ Works | all available as aarch64 apt packages on Ubuntu 22.04 |
 | **OpenVINO inference — `device: CPU`** | ✅ Works | Intel ships an official **arm64 Linux archive** for OpenVINO 2024.6.0 — but only built against **Ubuntu 20.04**, not 22.04 (`l_openvino_toolkit_ubuntu20_2024.6.0.17404.4c0f47d2335_arm64.tgz`; verified this downloads correctly). There is no `ubuntu22`+arm64 combination for this OpenVINO version. This is fine in practice: the archive bundles its own runtime libraries, and Ubuntu 22.04's glibc/libstdc++ are backwards-compatible with binaries built against 20.04's older ones, so it runs unmodified on the Jetson's Ubuntu 22.04 (JetPack 6) userspace. The Dockerfile handles this automatically. CPU plugin runs on ARM. |
-| **OpenVINO inference — `device: GPU`** | ❌ Does not work | OpenVINO's `GPU` plugin only targets **Intel** GPUs (iGPU/Arc via oneAPI/Level Zero). It has no backend for Jetson's NVIDIA/CUDA GPU. Every shipped config (`standard3.yaml`, `standard4.yaml`, `sentry.yaml`, `mvs.yaml`, `ascento.yaml`) sets `device: GPU` — **you must change this to `device: CPU`** in whatever config you deploy on a Jetson, or inference will fail to find a device. |
+| **OpenVINO inference — `device: GPU`** | ❌ Does not work | OpenVINO's `GPU` plugin only targets **Intel** GPUs (iGPU/Arc via oneAPI/Level Zero). It has no backend for Jetson's NVIDIA/CUDA GPU. Every shipped config (`standard3.yaml`, `standard4.yaml`, `sentry.yaml`, `mvs.yaml`, `ascento.yaml`) sets `device: GPU` — **you must change this to `device: CPU` or `device: CUDA`** in whatever config you deploy on a Jetson, or inference will fail to find a device. |
+| **`device: CUDA` (Jetson's own GPU)** | ✅ Works | Separate ONNX Runtime CUDA backend, not OpenVINO — see §5.6. Only `YOLOV5` supports it (the model every shipped config actually uses). |
 | ROS 2 (sentry mode) | ✅ Works, if wanted | JetPack 6 (Ubuntu 22.04) supports ROS 2 Humble same as any x86 Ubuntu 22.04 box. The `sentry*` executables also depend on a custom `sp_msgs` package that isn't in this repo, so full sentry functionality requires that package from elsewhere regardless of platform. |
 
 **Bottom line:** the codebase itself is portable — nothing in the vision pipeline
-is x86-specific. The one thing that will *not* magically work is GPU-accelerated
-inference, because OpenVINO's GPU backend is Intel-only. On a Jetson you get
-**CPU inference through OpenVINO**, which will be noticeably slower than the
-Intel iGPU path this project was tuned for on the NUC. If you need the Orin's
-GPU to actually accelerate inference, the models would need to be exported to
-TensorRT and the `auto_aim::YOLO`/`auto_buff` inference backends
-(`tasks/auto_aim/yolos/*`, `tasks/auto_buff/yolo11_buff.*`) would need a new
-TensorRT-based implementation alongside the existing OpenVINO one — that code
-does not exist in this repo today.
+is x86-specific. GPU-accelerated inference on Jetson's own NVIDIA GPU is
+possible via `device: CUDA` (§5.6), a separate backend from OpenVINO's GPU
+plugin (which is Intel-only and simply won't work here). `device: CPU`
+(OpenVINO's CPU plugin) remains available as a simpler fallback with no
+JetPack/NVIDIA Container Runtime setup required.
 
 Also note the `assets/*.xml`/`*.bin` files are OpenVINO IR models exported for
 FP32/INT8 — these load fine on the CPU plugin, no re-export needed to just get
@@ -177,10 +174,23 @@ docker run --rm -it \
   -v "$(pwd)/configs:/root/sp_vision_25/configs" \
   -v "$(pwd)/logs:/root/sp_vision_25/logs" \
   sp_vision_25 \
-  ./build/auto_aim_test configs/standard4.yaml
+  ./build/standard --config-path=configs/standard4.yaml
 ```
 
-Remember to edit whichever config you mount in to set `device: CPU` (see §4).
+Note the `--config-path=` (with `=`) — `auto_aim_test`/`standard`/etc. use
+OpenCV's `CommandLineParser`, which requires `--flag=value` or `-c=value`;
+a bare `configs/standard4.yaml` positional argument is silently interpreted
+as something else entirely (for `auto_aim_test`, the input *video* path) and
+the config path quietly falls back to its default instead of erroring. Also
+note `auto_aim_test` specifically replays a recorded video
+(`assets/demo/demo.avi`) — for a live camera/CAN/serial robot like this
+example implies, use `./build/standard` instead.
+
+Remember to edit whichever config you mount in to set `device: CPU` or
+`device: CUDA` (see §4) — every shipped config defaults to `device: GPU`,
+which does not work on Jetson. For `device: CUDA`, add
+`--runtime nvidia -e NVIDIA_VISIBLE_DEVICES=all` to the `docker run` command
+above (see §5.6).
 
 ### 5.3 Adding ROS 2 / sentry support (optional)
 
@@ -290,19 +300,67 @@ This was verified end-to-end on the actual dev machine's NVIDIA GPU: with
 
 **Not applicable to Jetson.** The CUDA runtime this installs is the generic
 x86_64 build; Jetson needs JetPack/L4T's own CUDA build tied to its embedded
-driver, which is a different (not-yet-done) installation path — see the
-known gap below.
+driver — see §5.6 for the Jetson-specific `device: CUDA` install instead.
+
+### 5.6 NVIDIA GPU acceleration on Jetson (`device: CUDA`)
+
+Jetson's GPU **is** NVIDIA, so unlike the x86_64 Intel-vs-NVIDIA split in
+§5.4/§5.5, this is the natural way to get real GPU acceleration on a Jetson
+— but it needs a different install than §5.5's x86_64 path, because
+Jetson's CUDA/cuDNN/TensorRT are JetPack/L4T-specific builds tied to
+whatever's flashed on the device, not a generic desktop CUDA install.
+
+**How it works, reflecting what a real device (JetPack 6, L4T R36.4.7, CUDA
+12.6, TensorRT 10.3, confirmed via `/etc/nv_tegra_release` and `dpkg`) showed:**
+
+- CUDA/cuDNN/TensorRT are **already installed on the Jetson host** by
+  JetPack — the Dockerfile does **not** apt-install any of them for
+  aarch64 (unlike the x86_64 path). Instead, the **NVIDIA Container
+  Runtime** bind-mounts the host's existing libraries into the container at
+  `docker run` time, the same way `/dev/dxg` + `/usr/lib/wsl/lib` bind-mount
+  Windows' GPU driver shims in §5.4. This only works because JetPack 6's
+  rootfs is itself Ubuntu 22.04 — matching this Dockerfile's base image, so
+  there's no glibc/libstdc++ ABI mismatch to worry about.
+- What the Dockerfile *does* install for aarch64: ONNX Runtime's shared
+  libraries (`libonnxruntime.so`, plus its CUDA and TensorRT execution
+  provider `.so`s), extracted from a community-built Jetson wheel
+  ([`ultralytics/assets`](https://github.com/ultralytics/assets/releases),
+  onnxruntime-gpu 1.23.0 for JetPack 6/CUDA 12.6 — Microsoft's official PyPI
+  package has no aarch64+Tegra build). Prebuilt wheels don't ship C/C++
+  headers, so the 5 headers `onnxruntime_cxx_api.h` actually needs are
+  pulled straight from the `microsoft/onnxruntime` GitHub repo at the
+  matching `v1.23.0` tag.
+- **Run the container with `--runtime nvidia -e NVIDIA_VISIBLE_DEVICES=all`**
+  (in addition to whatever else your run command needs, e.g.
+  `--privileged --network host -v /dev:/dev` for camera/CAN/serial) — this
+  is what actually triggers the Container Runtime to mount CUDA/cuDNN/TensorRT
+  in. `docker`'s `nvidia` runtime must already be registered
+  (`/etc/docker/daemon.json`, standard on JetPack) but is not the default
+  runtime, so it has to be requested explicitly on every `docker run`.
+
+**Caveat — not yet run-tested on a real Jetson.** Everything above was
+verified as far as possible without direct access to Jetson hardware: the
+wheel downloads and its contents were inspected (confirmed it contains
+`libonnxruntime.so.1.23.0`, `libonnxruntime_providers_cuda.so`,
+`libonnxruntime_providers_shared.so`, `libonnxruntime_providers_tensorrt.so`,
+and nothing else needed), and the matching headers were confirmed to exist
+at the same tag. But unlike the x86_64 CUDA path (§5.5, actually run against
+a real NVIDIA GPU end-to-end) and the Intel GPU path (§5.4, same), this
+aarch64 path has **not** been build- or run-tested on an actual Jetson —
+that's the next thing to verify. If `docker build` or the `device: CUDA`
+run fails on real hardware, the likely suspects are: a cuDNN/TensorRT
+version mismatch between what this onnxruntime build expects and what's on
+the device, or a missing NVIDIA Container Runtime mount (check
+`nvidia-smi`/`ls /usr/local/cuda*` *inside* a `--runtime nvidia` container
+first, in isolation from this project, to confirm the mount itself works).
 
 ## 6. Known gaps / things to verify on real hardware
 
-- **GPU inference is not available on Jetson** (see §4) — plan for CPU-plugin
-  latency, or budget time to add a TensorRT/JetPack-CUDA backend if frame rate
-  is insufficient. §5.5's `device: CUDA` path is real NVIDIA GPU acceleration
-  but is x86_64-only as implemented (generic CUDA runtime, not JetPack/L4T);
-  porting it to Jetson would mean a JetPack-specific base image/CUDA install
-  rather than reusing the apt packages used there today.
-- `device: CUDA` (§5.5) only has a working ONNX export for `yolov5` — the
-  model every shipped config actually uses. `yolo11`/`yolov8` don't have a
+- `device: CUDA` on Jetson (§5.6) has not been build/run-tested on real
+  hardware yet — see the caveat there for what to check if it fails.
+- `device: CUDA` (both §5.5 and §5.6) only has a working ONNX export for
+  `yolov5` — the model every shipped config actually uses. `yolo11`/`yolov8`
+  don't have a
   CUDA path.
 - Camera SDKs (HikRobot/MindVision) are vendored as prebuilt `.so` files with no
   visible build/version metadata in this repo — if the physical camera's
