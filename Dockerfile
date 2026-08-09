@@ -36,22 +36,25 @@
 # Runtime's CUDA execution provider instead of OpenVINO, using a .onnx
 # sibling of assets/yolov5.xml (same weights, converted offline -- see
 # JETSON_ORIN.md). Both x86_64 (NVIDIA dev-machine GPU) and aarch64 (Jetson's
-# own GPU) are supported, but via two completely different installs, because
-# desktop CUDA and Jetson/JetPack CUDA are different builds:
-#   - x86_64: a generic CUDA 12.6 runtime is apt-installed straight into the
-#     image from NVIDIA's desktop repo, paired with the generic
-#     onnxruntime-linux-x64-gpu release.
-#   - aarch64 (Jetson): CUDA/cuDNN/TensorRT are NOT installed into the image
-#     at all -- they already exist on the Jetson host (via JetPack) tied
-#     exactly to its flashed L4T version, and get bind-mounted into the
-#     container at `docker run --runtime nvidia` time by the NVIDIA
-#     Container Runtime (see JETSON_ORIN.md §5.6). Only ONNX Runtime's own
-#     libs go into the image here, built for aarch64+Jetson specifically
-#     (the generic aarch64 onnxruntime-gpu wheel on PyPI doesn't support
-#     Tegra, so this uses a community-built Jetson wheel instead); the
-#     matching public C++ headers are pulled straight from the onnxruntime
-#     GitHub repo at the same version tag, since prebuilt wheels don't ship
-#     C/C++ headers.
+# own GPU) are supported, but via two different apt repos/package sets,
+# because desktop CUDA and Jetson/JetPack CUDA are different builds:
+#   - x86_64: a generic CUDA 12.6 runtime is apt-installed from NVIDIA's
+#     desktop repo, paired with the generic onnxruntime-linux-x64-gpu
+#     release.
+#   - aarch64 (Jetson): CUDA/cuDNN/TensorRT are apt-installed from NVIDIA's
+#     Jetson/L4T repo instead (repo.download.nvidia.com/jetson), pinned to
+#     match the exact versions already on a reference JetPack 6 device
+#     (L4T R36.4.7). Confirmed on real hardware that `docker run --runtime
+#     nvidia` does NOT bind-mount these in on JetPack 6 -- unlike JetPack
+#     4.x, its NVIDIA Container Runtime CSV mounts only cover GPU device
+#     nodes and display/graphics libs, not CUDA/cuDNN/TensorRT -- so, same
+#     as x86_64, they have to be baked into the image. `--runtime nvidia` is
+#     still required at `docker run` time for the GPU device nodes
+#     themselves. ONNX Runtime's own libs come from a community aarch64
+#     Jetson build (the generic aarch64 onnxruntime-gpu wheel on PyPI has no
+#     Tegra support); the matching public C++ headers are pulled straight
+#     from the onnxruntime GitHub repo at the same version tag, since
+#     prebuilt wheels don't ship C/C++ headers. See JETSON_ORIN.md §5.6.
 # At container run time NVIDIA access on Windows/WSL2 comes through the same
 # `--device=/dev/dxg -v /usr/lib/wsl:/usr/lib/wsl` as the Intel path above
 # (Docker Desktop mirrors both vendors' driver shims there); on native Linux
@@ -150,12 +153,39 @@ RUN set -eux; \
         ldconfig; \
     fi
 
-# aarch64 (Jetson): no CUDA/cuDNN/TensorRT apt-install -- those come from the
-# host at `docker run --runtime nvidia` time (see note above). Just unpacks
-# ONNX Runtime's aarch64+CUDA+TensorRT libs from a community Jetson build
-# (JetPack 6.x / CUDA 12.6, matching what JETSON_ORIN.md's diagnostics found
-# on the reference device) and fetches the matching public C++ headers
-# directly from the onnxruntime source tree at the same version tag.
+# aarch64 (Jetson): CUDA/cuDNN/TensorRT ARE apt-installed directly into the
+# image here, from NVIDIA's Jetson/L4T apt repo -- *not* relying on
+# `docker run --runtime nvidia` to mount them from the host. Verified against
+# a real JetPack 6 device (L4T R36.4.7): as of JetPack 5+, the NVIDIA
+# Container Runtime's CSV auto-mount mechanism only covers GPU *device
+# nodes* and display/graphics libs (its devices.csv/drivers.csv) -- it does
+# NOT mount CUDA/cuDNN/TensorRT anymore (that was the older JetPack 4.x
+# behavior). So `--runtime nvidia` is still required at `docker run` time
+# for the actual GPU device nodes, but the compute libraries themselves have
+# to be baked into the image, same as the x86_64 path above -- just from
+# NVIDIA's Jetson repo instead of the desktop one, using the exact package
+# versions confirmed present on the reference device (CUDA 12.6.68,
+# cuDNN 9.3.0, r36.4 suite). If you're on a different JetPack/L4T version,
+# check `apt-cache policy cuda-cudart-12-6` on the device first -- the L4T
+# apt suite (`r36.4` below) must match `cat /etc/nv_tegra_release`.
+RUN set -eux; \
+    if [ "$(uname -m)" = "aarch64" ]; then \
+        wget -qO /etc/apt/trusted.gpg.d/jetson-ota-public.asc https://repo.download.nvidia.com/jetson/jetson-ota-public.asc; \
+        chmod 644 /etc/apt/trusted.gpg.d/jetson-ota-public.asc; \
+        echo 'deb https://repo.download.nvidia.com/jetson/common r36.4 main' > /etc/apt/sources.list.d/nvidia-l4t-apt-source.list; \
+        echo 'deb https://repo.download.nvidia.com/jetson/t234 r36.4 main' >> /etc/apt/sources.list.d/nvidia-l4t-apt-source.list; \
+        apt-get update; \
+        apt-get install -y --no-install-recommends \
+            cuda-cudart-12-6 cuda-nvrtc-12-6 libcublas-12-6 libcufft-12-6 \
+            libcurand-12-6 libcusparse-12-6 libcusolver-12-6 libcudnn9-cuda-12; \
+        rm -rf /var/lib/apt/lists/*; \
+    fi
+
+# ONNX Runtime for aarch64+CUDA+TensorRT, extracted from a community Jetson
+# build (JetPack 6.x / CUDA 12.6 -- Microsoft's official PyPI package has no
+# aarch64+Tegra build). Prebuilt wheels don't ship C/C++ headers, so those
+# are fetched separately, straight from the onnxruntime source tree at the
+# matching version tag.
 ARG ONNXRUNTIME_JETSON_VERSION=1.23.0
 ARG ONNXRUNTIME_JETSON_WHEEL_URL=https://github.com/ultralytics/assets/releases/download/v0.0.0/onnxruntime_gpu-1.23.0-cp310-cp310-linux_aarch64.whl
 RUN set -eux; \

@@ -311,57 +311,66 @@ Jetson's CUDA/cuDNN/TensorRT are JetPack/L4T-specific builds tied to
 whatever's flashed on the device, not a generic desktop CUDA install.
 
 **How it works, reflecting what a real device (JetPack 6, L4T R36.4.7, CUDA
-12.6, TensorRT 10.3, confirmed via `/etc/nv_tegra_release` and `dpkg`) showed:**
+12.6.68, cuDNN 9.3.0, TensorRT 10.3) showed, including one wrong assumption
+this section originally made and had to correct after testing on hardware:**
 
-- CUDA/cuDNN/TensorRT are **already installed on the Jetson host** by
-  JetPack — the Dockerfile does **not** apt-install any of them for
-  aarch64 (unlike the x86_64 path). Instead, the **NVIDIA Container
-  Runtime** bind-mounts the host's existing libraries into the container at
-  `docker run` time, the same way `/dev/dxg` + `/usr/lib/wsl/lib` bind-mount
-  Windows' GPU driver shims in §5.4. This only works because JetPack 6's
-  rootfs is itself Ubuntu 22.04 — matching this Dockerfile's base image, so
-  there's no glibc/libstdc++ ABI mismatch to worry about.
-- What the Dockerfile *does* install for aarch64: ONNX Runtime's shared
-  libraries (`libonnxruntime.so`, plus its CUDA and TensorRT execution
-  provider `.so`s), extracted from a community-built Jetson wheel
+- **First attempt (wrong):** assumed CUDA/cuDNN/TensorRT should stay off the
+  image and get bind-mounted in from the host by the NVIDIA Container
+  Runtime at `docker run --runtime nvidia` time — this is genuinely how it
+  worked on older JetPack 4.x, and is exactly how the *Intel* GPU path in
+  §5.4 works via `/dev/dxg` + `/usr/lib/wsl/lib`. On this JetPack 6 device it
+  doesn't apply: `cat /etc/nvidia-container-runtime/config.toml` showed
+  `mode = "auto"`, and the only CSV manifests present under
+  `/etc/nvidia-container-runtime/host-files-for-container.d/` were
+  `devices.csv` (GPU/display device nodes) and `drivers.csv` (display/weston
+  libs) — no `cuda.csv`/`cudnn.csv`/`tensorrt.csv`. Confirmed by running with
+  `--runtime nvidia -e NVIDIA_VISIBLE_DEVICES=all -e NVIDIA_DRIVER_CAPABILITIES=all`
+  and finding `/usr/local/cuda*/lib64/libcublas*` simply didn't exist inside
+  the container. As of JetPack 5+, NVIDIA moved to baking CUDA/cuDNN/TensorRT
+  into the container image itself instead (the CSV auto-mount mechanism now
+  only covers device nodes and display libs).
+- **What actually works:** CUDA/cuDNN are apt-installed straight into the
+  image, same as the x86_64 path, just from NVIDIA's **Jetson/L4T** apt repo
+  (`repo.download.nvidia.com/jetson/{common,t234}`, suite `r36.4`) instead of
+  the desktop one, using the `jetson-ota-public.asc` signing key, and pinned
+  to `cuda-cudart-12-6`/`libcudnn9-cuda-12`/etc. — the exact package names
+  and versions confirmed already present on the reference device via
+  `apt-cache policy`. `--runtime nvidia -e NVIDIA_VISIBLE_DEVICES=all` is
+  still required at `docker run` time, just for a narrower purpose now: the
+  actual GPU device nodes (`/dev/nvhost-gpu`, `/dev/nvmap`, etc. from
+  `devices.csv`), which genuinely do still come from the host, not the image.
+- ONNX Runtime's own libraries (`libonnxruntime.so`, plus its CUDA and
+  TensorRT execution provider `.so`s) are separate from the CUDA/cuDNN
+  install above — extracted from a community-built Jetson wheel
   ([`ultralytics/assets`](https://github.com/ultralytics/assets/releases),
   onnxruntime-gpu 1.23.0 for JetPack 6/CUDA 12.6 — Microsoft's official PyPI
   package has no aarch64+Tegra build). Prebuilt wheels don't ship C/C++
   headers, so the 5 headers `onnxruntime_cxx_api.h` actually needs are
   pulled straight from the `microsoft/onnxruntime` GitHub repo at the
   matching `v1.23.0` tag.
-- **Run the container with `--runtime nvidia -e NVIDIA_VISIBLE_DEVICES=all`**
-  (in addition to whatever else your run command needs, e.g.
-  `--privileged --network host -v /dev:/dev` for camera/CAN/serial) — this
-  is what actually triggers the Container Runtime to mount CUDA/cuDNN/TensorRT
-  in. `docker`'s `nvidia` runtime must already be registered
-  (`/etc/docker/daemon.json`, standard on JetPack) but is not the default
-  runtime, so it has to be requested explicitly on every `docker run`.
 
-**Caveat — not yet run-tested on a real Jetson.** Everything above was
-verified as far as possible without direct access to Jetson hardware: the
-wheel downloads and its contents were inspected (confirmed it contains
-`libonnxruntime.so.1.23.0`, `libonnxruntime_providers_cuda.so`,
-`libonnxruntime_providers_shared.so`, `libonnxruntime_providers_tensorrt.so`,
-and nothing else needed), and the matching headers were confirmed to exist
-at the same tag. But unlike the x86_64 CUDA path (§5.5, actually run against
-a real NVIDIA GPU end-to-end) and the Intel GPU path (§5.4, same), this
-aarch64 path has **not** been build- or run-tested on an actual Jetson —
-that's the next thing to verify. If `docker build` or the `device: CUDA`
-run fails on real hardware, the likely suspects are: a cuDNN/TensorRT
-version mismatch between what this onnxruntime build expects and what's on
-the device, or a missing NVIDIA Container Runtime mount (check
-`nvidia-smi`/`ls /usr/local/cuda*` *inside* a `--runtime nvidia` container
-first, in isolation from this project, to confirm the mount itself works).
+**If you're on a different JetPack/L4T version than R36.4.7**, the apt
+suite pinned in the Dockerfile (`r36.4`) needs to match — check
+`cat /etc/nv_tegra_release` and `apt-cache policy cuda-cudart-12-6` on the
+device and adjust the `r36.4` in the Dockerfile's Jetson CUDA block
+accordingly.
+
+**Status: reached real GPU inference on hardware, still debugging a
+missing-library error.** This was iterated against an actual Jetson Orin
+Nano (not simulated) through several rounds: first hit an OpenVINO
+`device: GPU`-not-registered error (expected — that's the Intel-only plugin,
+§4), then a `libcublasLt.so.12` load failure (from the wrong assumption
+above — being fixed by baking CUDA in directly instead of relying on
+`--runtime nvidia` mounts). Update this section once the corrected
+Dockerfile has been confirmed working end-to-end.
 
 ## 6. Known gaps / things to verify on real hardware
 
-- `device: CUDA` on Jetson (§5.6) has not been build/run-tested on real
-  hardware yet — see the caveat there for what to check if it fails.
+- `device: CUDA` on Jetson (§5.6) is still being iterated against real
+  hardware — status/next-fix noted at the end of §5.6.
 - `device: CUDA` (both §5.5 and §5.6) only has a working ONNX export for
   `yolov5` — the model every shipped config actually uses. `yolo11`/`yolov8`
-  don't have a
-  CUDA path.
+  don't have a CUDA path.
 - Camera SDKs (HikRobot/MindVision) are vendored as prebuilt `.so` files with no
   visible build/version metadata in this repo — if the physical camera's
   firmware requires a newer SDK than what's bundled, you'll need to source an
