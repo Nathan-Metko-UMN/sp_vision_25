@@ -163,11 +163,26 @@ RUN set -eux; \
 # behavior). So `--runtime nvidia` is still required at `docker run` time
 # for the actual GPU device nodes, but the compute libraries themselves have
 # to be baked into the image, same as the x86_64 path above -- just from
-# NVIDIA's Jetson repo instead of the desktop one, using the exact package
-# versions confirmed present on the reference device (CUDA 12.6.68,
-# cuDNN 9.3.0, r36.4 suite). If you're on a different JetPack/L4T version,
-# check `apt-cache policy cuda-cudart-12-6` on the device first -- the L4T
-# apt suite (`r36.4` below) must match `cat /etc/nv_tegra_release`.
+# NVIDIA's Jetson repo instead of the desktop one.
+#
+# Installs the `cuda-libraries-12-6` meta-package (every CUDA runtime math
+# library, apt-resolved -- no nvcc/compiler, we don't compile CUDA kernels
+# ourselves) rather than a hand-picked subset of runtime libs. A hand-picked
+# list (cudart/cublas/cufft/curand/cusparse/cusolver) looked complete but
+# caused a hard-to-diagnose SIGSEGV inside the CUDA EP on real Jetson
+# hardware -- CUDA 12.x split libnvJitLink out as its own package, a
+# transitive runtime dependency of cuBLAS/cuSOLVER that isn't obvious from
+# the shared library names alone, and apt's own dependency resolution
+# catches this sort of thing where a manually-curated list won't. (The clue:
+# a separate `nvidia/cuda:12.9.0-devel-*` based container -- full toolkit,
+# apt-resolved, not hand-picked -- is confirmed to run GPU workloads fine on
+# the same reference device. `cuda-libraries-12-6` here is the Jetson repo's
+# runtime-only equivalent of that full toolkit's libraries, chosen to avoid
+# pulling in a compiler toolchain we don't need -- not itself verified
+# working yet, that's the next thing to confirm.) If you're on a different
+# JetPack/L4T version than R36.4.7, check
+# `apt-cache policy cuda-libraries-12-6` on the device first -- the L4T apt
+# suite (`r36.4` below) must match `cat /etc/nv_tegra_release`.
 RUN set -eux; \
     if [ "$(uname -m)" = "aarch64" ]; then \
         wget -qO /etc/apt/trusted.gpg.d/jetson-ota-public.asc https://repo.download.nvidia.com/jetson/jetson-ota-public.asc; \
@@ -175,9 +190,7 @@ RUN set -eux; \
         echo 'deb https://repo.download.nvidia.com/jetson/common r36.4 main' > /etc/apt/sources.list.d/nvidia-l4t-apt-source.list; \
         echo 'deb https://repo.download.nvidia.com/jetson/t234 r36.4 main' >> /etc/apt/sources.list.d/nvidia-l4t-apt-source.list; \
         apt-get update; \
-        apt-get install -y --no-install-recommends \
-            cuda-cudart-12-6 cuda-nvrtc-12-6 libcublas-12-6 libcufft-12-6 \
-            libcurand-12-6 libcusparse-12-6 libcusolver-12-6 libcudnn9-cuda-12; \
+        apt-get install -y --no-install-recommends cuda-libraries-12-6 libcudnn9-cuda-12; \
         rm -rf /var/lib/apt/lists/*; \
     fi
 
