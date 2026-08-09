@@ -3,6 +3,7 @@
 #include <fmt/chrono.h>
 #include <yaml-cpp/yaml.h>
 
+#include <array>
 #include <filesystem>
 
 #include "tools/img_tools.hpp"
@@ -31,27 +32,61 @@ YOLOV5::YOLOV5(const std::string & config_path, bool debug)
 
   save_path_ = "imgs";
   std::filesystem::create_directory(save_path_);
-  auto model = core_.read_model(model_path_);
-  ov::preprocess::PrePostProcessor ppp(model);
-  auto & input = ppp.input();
 
-  input.tensor()
-    .set_element_type(ov::element::u8)
-    .set_shape({1, 640, 640, 3})
-    .set_layout("NHWC")
-    .set_color_format(ov::preprocess::ColorFormat::BGR);
+  if (device_ == "CUDA") {
+#ifdef HAVE_ONNXRUNTIME
+    use_cuda_ = true;
 
-  input.model().set_layout("NCHW");
+    // OpenVINO's GPU plugin only ever talks to an Intel GPU. NVIDIA GPU
+    // acceleration goes through this separate ONNX Runtime CUDA backend
+    // instead, using a .onnx sibling of the .xml/.bin IR model (same
+    // weights, converted offline -- see JETSON_ORIN.md). The IR model does
+    // BGR->RGB/u8->f32/scale(255) and NHWC->NCHW via the OpenVINO
+    // preprocessor above; the ONNX export has no such preprocessor attached,
+    // so that conversion is done manually below before feeding the tensor in.
+    auto dot = model_path_.find_last_of('.');
+    auto onnx_path = (dot == std::string::npos ? model_path_ : model_path_.substr(0, dot)) + ".onnx";
 
-  input.preprocess()
-    .convert_element_type(ov::element::f32)
-    .convert_color(ov::preprocess::ColorFormat::RGB)
-    .scale(255.0);
+    ort_env_ = std::make_unique<Ort::Env>(ORT_LOGGING_LEVEL_WARNING, "yolov5");
+    Ort::SessionOptions session_options;
+    OrtCUDAProviderOptions cuda_options{};
+    session_options.AppendExecutionProvider_CUDA(cuda_options);
+    ort_session_ = std::make_unique<Ort::Session>(*ort_env_, onnx_path.c_str(), session_options);
 
-  // TODO: ov::hint::performance_mode(ov::hint::PerformanceMode::LATENCY)
-  model = ppp.build();
-  compiled_model_ = core_.compile_model(
-    model, device_, ov::hint::performance_mode(ov::hint::PerformanceMode::LATENCY));
+    Ort::AllocatorWithDefaultOptions allocator;
+    ort_input_name_ = ort_session_->GetInputNameAllocated(0, allocator).get();
+    ort_output_name_ = ort_session_->GetOutputNameAllocated(0, allocator).get();
+
+    tools::logger()->info(
+      "YOLOV5: using ONNX Runtime CUDA backend, model={}", onnx_path);
+#else
+    throw std::runtime_error(
+      "device: CUDA requires building with ONNX Runtime support, but onnxruntime "
+      "wasn't found at configure time (see JETSON_ORIN.md)");
+#endif
+  } else {
+    auto model = core_.read_model(model_path_);
+    ov::preprocess::PrePostProcessor ppp(model);
+    auto & input = ppp.input();
+
+    input.tensor()
+      .set_element_type(ov::element::u8)
+      .set_shape({1, 640, 640, 3})
+      .set_layout("NHWC")
+      .set_color_format(ov::preprocess::ColorFormat::BGR);
+
+    input.model().set_layout("NCHW");
+
+    input.preprocess()
+      .convert_element_type(ov::element::f32)
+      .convert_color(ov::preprocess::ColorFormat::RGB)
+      .scale(255.0);
+
+    // TODO: ov::hint::performance_mode(ov::hint::PerformanceMode::LATENCY)
+    model = ppp.build();
+    compiled_model_ = core_.compile_model(
+      model, device_, ov::hint::performance_mode(ov::hint::PerformanceMode::LATENCY));
+  }
 }
 
 std::list<Armor> YOLOV5::detect(const cv::Mat & raw_img, int frame_count)
@@ -84,20 +119,65 @@ std::list<Armor> YOLOV5::detect(const cv::Mat & raw_img, int frame_count)
   auto input = cv::Mat(640, 640, CV_8UC3, cv::Scalar(0, 0, 0));
   auto roi = cv::Rect(0, 0, w, h);
   cv::resize(bgr_img, input(roi), {w, h});
+
+#ifdef HAVE_ONNXRUNTIME
+  cv::Mat output = use_cuda_ ? infer_cuda(input) : infer_openvino(input);
+#else
+  cv::Mat output = infer_openvino(input);
+#endif
+
+  return parse(scale, output, raw_img, frame_count);
+}
+
+cv::Mat YOLOV5::infer_openvino(const cv::Mat & input)
+{
   ov::Tensor input_tensor(ov::element::u8, {1, 640, 640, 3}, input.data);
 
-  // infer
   auto infer_request = compiled_model_.create_infer_request();
   infer_request.set_input_tensor(input_tensor);
   infer_request.infer();
 
-  // postprocess
   auto output_tensor = infer_request.get_output_tensor();
   auto output_shape = output_tensor.get_shape();
-  cv::Mat output(output_shape[1], output_shape[2], CV_32F, output_tensor.data());
-
-  return parse(scale, output, raw_img, frame_count);
+  // clone(): infer_request (and the buffer output_tensor views) is destroyed
+  // when this function returns, so the caller needs its own copy.
+  return cv::Mat(output_shape[1], output_shape[2], CV_32F, output_tensor.data()).clone();
 }
+
+#ifdef HAVE_ONNXRUNTIME
+cv::Mat YOLOV5::infer_cuda(const cv::Mat & input)
+{
+  // The plain .onnx export has no baked-in preprocessor (unlike the IR model
+  // above, which gets one from ov::preprocess::PrePostProcessor at load
+  // time), so BGR->RGB, u8->f32/255, and HWC->CHW all happen here by hand.
+  cv::Mat rgb, chw_input(3, 640 * 640, CV_32F);
+  cv::cvtColor(input, rgb, cv::COLOR_BGR2RGB);
+  rgb.convertTo(rgb, CV_32F, 1.0 / 255.0);
+
+  std::vector<cv::Mat> channels(3);
+  for (int c = 0; c < 3; c++) channels[c] = cv::Mat(640, 640, CV_32F, chw_input.ptr(c));
+  cv::split(rgb, channels);
+
+  std::array<int64_t, 4> input_shape{1, 3, 640, 640};
+  Ort::MemoryInfo mem_info = Ort::MemoryInfo::CreateCpu(OrtArenaAllocator, OrtMemTypeDefault);
+  Ort::Value input_tensor = Ort::Value::CreateTensor<float>(
+    mem_info, reinterpret_cast<float *>(chw_input.data), chw_input.total(), input_shape.data(),
+    input_shape.size());
+
+  const char * input_names[] = {ort_input_name_.c_str()};
+  const char * output_names[] = {ort_output_name_.c_str()};
+  auto outputs = ort_session_->Run(
+    Ort::RunOptions{nullptr}, input_names, &input_tensor, 1, output_names, 1);
+
+  auto shape = outputs[0].GetTensorTypeAndShapeInfo().GetShape();
+  // clone(): `outputs` is destroyed when this function returns, so the
+  // caller needs its own copy.
+  return cv::Mat(
+           static_cast<int>(shape[1]), static_cast<int>(shape[2]), CV_32F,
+           const_cast<float *>(outputs[0].GetTensorData<float>()))
+    .clone();
+}
+#endif
 
 std::list<Armor> YOLOV5::parse(
   double scale, cv::Mat & output, const cv::Mat & bgr_img, int frame_count)

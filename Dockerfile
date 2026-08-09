@@ -30,6 +30,19 @@
 #   - native Linux host: `docker run --device=/dev/dri ...`
 #   - Windows host via Docker Desktop/WSL2: `docker run --device=/dev/dxg
 #     -v /usr/lib/wsl:/usr/lib/wsl ...` (see JETSON_ORIN.md appendix)
+#
+# `device: CUDA` is a second, independent GPU backend for NVIDIA GPUs, since
+# OpenVINO's GPU plugin above can never use one. It runs YOLOV5 through ONNX
+# Runtime's CUDA execution provider instead of OpenVINO, using a .onnx
+# sibling of assets/yolov5.xml (same weights, converted offline -- see
+# JETSON_ORIN.md). x86_64 only here too: this installs a generic x86_64 CUDA
+# runtime, which is NOT what Jetson needs (Jetson requires JetPack/L4T's own
+# CUDA build tied to its embedded driver) -- so this path is for the NVIDIA
+# GPU on an x86_64 dev machine, not Jetson. At container run time NVIDIA
+# access on Windows/WSL2 comes through the same `--device=/dev/dxg
+# -v /usr/lib/wsl:/usr/lib/wsl` as the Intel path above (Docker Desktop
+# mirrors both vendors' driver shims there); on native Linux use `--gpus all`
+# (needs the NVIDIA Container Toolkit installed on the host).
 
 FROM ubuntu:22.04
 
@@ -95,6 +108,42 @@ RUN set -eux; \
         apt-get install -y --no-install-recommends intel-opencl-icd intel-level-zero-gpu level-zero clinfo; \
         rm -rf /var/lib/apt/lists/*; \
     fi
+
+# --- NVIDIA CUDA runtime + ONNX Runtime GPU (needed for `device: CUDA`) ---
+# x86_64 only -- see note above. cuda-cudart/cublas/cufft/curand/cusparse/
+# cusolver + cudnn9 + nvrtc are the minimal runtime pieces ONNX Runtime's
+# CUDA execution provider needs (no nvcc/full toolkit required). Pinned to
+# CUDA 12.6 + cuDNN 9, the combination ONNX Runtime 1.20.x's GPU build
+# expects; the container only needs a driver new enough to run *some* CUDA
+# 12.x, which is what NVIDIA driver backward compatibility guarantees.
+ARG ONNXRUNTIME_VERSION=1.20.1
+RUN set -eux; \
+    if [ "$(uname -m)" = "x86_64" ]; then \
+        wget -q https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2204/x86_64/cuda-keyring_1.1-1_all.deb -O /tmp/cuda-keyring.deb; \
+        dpkg -i /tmp/cuda-keyring.deb; \
+        rm /tmp/cuda-keyring.deb; \
+        apt-get update; \
+        apt-get install -y --no-install-recommends \
+            cuda-cudart-12-6 cuda-nvrtc-12-6 libcublas-12-6 libcufft-12-6 \
+            libcurand-12-6 libcusparse-12-6 libcusolver-12-6 libcudnn9-cuda-12; \
+        rm -rf /var/lib/apt/lists/*; \
+        url="https://github.com/microsoft/onnxruntime/releases/download/v${ONNXRUNTIME_VERSION}/onnxruntime-linux-x64-gpu-${ONNXRUNTIME_VERSION}.tgz"; \
+        wget -q "$url" -O /tmp/onnxruntime.tgz; \
+        mkdir -p /opt/onnxruntime; \
+        tar -xzf /tmp/onnxruntime.tgz -C /opt/onnxruntime --strip-components=1; \
+        rm /tmp/onnxruntime.tgz; \
+        echo /opt/onnxruntime/lib > /etc/ld.so.conf.d/onnxruntime.conf; \
+        ldconfig; \
+    fi
+
+# libcuda.so itself (the actual GPU driver, as opposed to the CUDA *runtime*
+# libs installed above) is never baked into the image -- on native Linux it
+# comes from the host's NVIDIA driver install (standard ldconfig path via
+# the NVIDIA Container Toolkit), but on Windows/WSL2 it only exists inside
+# the /usr/lib/wsl/lib bind mount (see note above), which isn't in the
+# dynamic linker's cache since it's not present at build time. Harmless
+# no-op on hosts where that path doesn't exist.
+ENV LD_LIBRARY_PATH=/usr/lib/wsl/lib:$LD_LIBRARY_PATH
 
 WORKDIR /root/sp_vision_25
 COPY . .

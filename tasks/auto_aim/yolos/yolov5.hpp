@@ -7,6 +7,12 @@
 #include <string>
 #include <vector>
 
+#ifdef HAVE_ONNXRUNTIME
+#include <onnxruntime_cxx_api.h>
+
+#include <memory>
+#endif
+
 #include "tasks/auto_aim/armor.hpp"
 #include "tasks/auto_aim/detector.hpp"
 #include "tasks/auto_aim/yolo.hpp"
@@ -35,6 +41,15 @@ private:
 
   ov::Core core_;
   ov::CompiledModel compiled_model_;
+
+  bool use_cuda_ = false;
+#ifdef HAVE_ONNXRUNTIME
+  std::unique_ptr<Ort::Env> ort_env_;
+  std::unique_ptr<Ort::Session> ort_session_;
+  std::string ort_input_name_, ort_output_name_;
+  cv::Mat infer_cuda(const cv::Mat & input);
+#endif
+  cv::Mat infer_openvino(const cv::Mat & input);
 
   cv::Rect roi_;
   cv::Point2f offset_;

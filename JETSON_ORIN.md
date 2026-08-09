@@ -228,11 +228,82 @@ OpenVINO device-not-found error. Note this only works for an **Intel** GPU —
 an NVIDIA GPU on the same Windows machine is irrelevant here, since OpenVINO's
 GPU plugin never talks to NVIDIA hardware (same restriction as Jetson in §4).
 
+### 5.5 NVIDIA GPU acceleration (`device: CUDA`)
+
+Since OpenVINO's `GPU` device can never use an NVIDIA card, NVIDIA GPU
+acceleration is a **second, independent inference backend**: setting
+`device: CUDA` in a yaml config makes `YOLOV5` (the only model any shipped
+config actually uses — see below) run through **ONNX Runtime's CUDA
+execution provider** instead of OpenVINO, while every other class
+(`YOLO11`/`YOLOV8`) and every other part of the pipeline (tracker, aimer,
+solver, ...) is completely unchanged.
+
+**Why not just point OpenVINO at the NVIDIA GPU?** There's a community
+`nvidia_plugin` for OpenVINO (in `openvino_contrib`), but it's pinned to
+OpenVINO **2024.1.0** (this repo hard-codes 2024.6.0 — plugins aren't
+ABI-compatible across versions), needs OpenVINO built from source plus exact
+CUDA 11.8 / cuDNN 8.6.0 / cuTENSOR 1.6.1 versions, and isn't part of Intel's
+distribution. Too fragile to depend on. ONNX Runtime's CUDA EP is the
+actively maintained, officially supported way to run a model on an NVIDIA GPU
+outside OpenVINO.
+
+**Where `assets/yolov5.onnx` came from:** OpenVINO can convert *into* IR from
+ONNX, but not back out — there's no supported IR→ONNX path. `assets/yolov5.onnx`
+was produced with the third-party
+[`openvino2onnx`](https://pypi.org/project/openvino2onnx/) tool
+(`python -m openvino2onnx assets/yolov5.xml assets/yolov5.onnx`) from the
+exact same `assets/yolov5.xml`/`.bin` weights the OpenVINO path uses — not a
+retrained or re-exported model. This was numerically validated (not just
+"it loads"): both the IR and the resulting ONNX were run on identical real
+video frames through OpenVINO and ONNX Runtime respectively, and the outputs
+matched to ~1e-3 (bounding boxes, class scores, and the top detection all
+identical). The same approach was tried for `yolo11.xml`, but the converted
+model failed ONNX Runtime's own load-time shape inference (a YOLO11-specific
+op in its detection head didn't survive conversion) — since no shipped
+config actually uses `yolo_name: yolo11` or `yolov8` (every config uses
+`yolov5`), this wasn't pursued further. Extending `device: CUDA` to those
+classes would mean either fixing that conversion or sourcing the original
+pre-IR `.onnx`/`.pt` weights, and duplicating the small amount of
+CUDA-backend plumbing added to `yolov5.hpp`/`.cpp` into `yolo11.hpp`/`.cpp`
+and `yolov8.hpp`/`.cpp`.
+
+**Build-time requirements** (all x86_64-only, added to the Dockerfile):
+CUDA 12.6 runtime + cuDNN 9 (`cuda-cudart-12-6`, `libcublas-12-6`, etc., via
+NVIDIA's apt repo — not the full CUDA toolkit, no `nvcc` needed) and the
+prebuilt `onnxruntime-linux-x64-gpu` release, unpacked to `/opt/onnxruntime`.
+`tasks/auto_aim/CMakeLists.txt` looks for it there; if it's missing, the
+project still builds fine, just without `device: CUDA` support (attempting
+to use it at runtime throws a clear error instead of silently falling back).
+
+**Run-time GPU passthrough** uses the same mechanism as §5.4: on this
+Windows/WSL2 machine, `--device=/dev/dxg -v /usr/lib/wsl:/usr/lib/wsl` covers
+*both* the Intel and NVIDIA driver shims Docker Desktop mirrors there (no
+separate `--gpus all` needed — the existing `devcontainer.json` config
+already provides NVIDIA access as-is). On native Linux, use `--gpus all`
+(requires the NVIDIA Container Toolkit on the host).
+
+This was verified end-to-end on the actual dev machine's NVIDIA GPU: with
+`configs/demo_cuda.yaml` (a copy of `demo.yaml` with `device: CUDA`),
+`auto_aim_test` logged `YOLOV5: using ONNX Runtime CUDA backend`, then ran
+250+ frames at ~5-19ms per yolo+tracker+aimer cycle (after an expected
+~1s first-frame CUDA/cuDNN JIT warmup) with no errors.
+
+**Not applicable to Jetson.** The CUDA runtime this installs is the generic
+x86_64 build; Jetson needs JetPack/L4T's own CUDA build tied to its embedded
+driver, which is a different (not-yet-done) installation path — see the
+known gap below.
+
 ## 6. Known gaps / things to verify on real hardware
 
 - **GPU inference is not available on Jetson** (see §4) — plan for CPU-plugin
-  latency, or budget time to add a TensorRT backend if frame rate is
-  insufficient.
+  latency, or budget time to add a TensorRT/JetPack-CUDA backend if frame rate
+  is insufficient. §5.5's `device: CUDA` path is real NVIDIA GPU acceleration
+  but is x86_64-only as implemented (generic CUDA runtime, not JetPack/L4T);
+  porting it to Jetson would mean a JetPack-specific base image/CUDA install
+  rather than reusing the apt packages used there today.
+- `device: CUDA` (§5.5) only has a working ONNX export for `yolov5` — the
+  model every shipped config actually uses. `yolo11`/`yolov8` don't have a
+  CUDA path.
 - Camera SDKs (HikRobot/MindVision) are vendored as prebuilt `.so` files with no
   visible build/version metadata in this repo — if the physical camera's
   firmware requires a newer SDK than what's bundled, you'll need to source an
