@@ -196,6 +196,38 @@ vendored here. If you have access to it and want the sentry build:
 3. Re-run `cmake -B build && cmake --build build` — the `sentry*` targets will
    then be included automatically since the CMake ROS2 guard will pass.
 
+### 5.4 Intel GPU acceleration on Windows (Docker Desktop / WSL2)
+
+Not a Jetson topic, but the same `device: GPU` OpenVINO setting from §4, so
+it's documented here: if you're developing on a Windows machine with an Intel
+iGPU (not the Jetson itself), the Dockerfile now installs Intel's actual GPU
+compute runtime (`intel-opencl-icd`, `intel-level-zero-gpu`) — the OpenVINO
+dependency script alone only installs the generic OpenCL ICD loader, which is
+not enough for the GPU plugin to find a device.
+
+Even with the runtime installed, the **container still needs the host GPU
+device passed through at run time**:
+
+- **Native Linux host:** `docker run --device=/dev/dri ...`
+- **Windows host via Docker Desktop/WSL2:** there is no `/dev/dri` in Docker
+  Desktop's WSL VM. GPU access instead goes through the WSL GPU
+  paravirtualization device `/dev/dxg` plus the vendor driver shim libraries
+  Docker Desktop mirrors from the host under `/usr/lib/wsl/lib`:
+  ```
+  docker run --device=/dev/dxg -v /usr/lib/wsl:/usr/lib/wsl ...
+  ```
+  `.devcontainer/devcontainer.json` in this repo already sets this up via
+  `runArgs`/`mounts`, so opening this repo in VS Code's Dev Containers on this
+  machine gets GPU access automatically — rebuild the container
+  (**Dev Containers: Rebuild Container**) to pick it up.
+
+This was verified end-to-end: `auto_aim_test` run against `configs/demo.yaml`
+(`device: GPU`) inside the container, with the host's Intel UHD Graphics iGPU
+passed through this way, ran YOLO inference at ~9-10ms/frame with no
+OpenVINO device-not-found error. Note this only works for an **Intel** GPU —
+an NVIDIA GPU on the same Windows machine is irrelevant here, since OpenVINO's
+GPU plugin never talks to NVIDIA hardware (same restriction as Jetson in §4).
+
 ## 6. Known gaps / things to verify on real hardware
 
 - **GPU inference is not available on Jetson** (see §4) — plan for CPU-plugin
@@ -216,6 +248,9 @@ vendored here. If you have access to it and want the sentry build:
   page — an earlier draft of this Dockerfile silently downloaded an HTML 404
   page because the URL path/filename versioning is inconsistent on Intel's
   download server; the current Dockerfile avoids that trap).
+- **Also verified:** `device: GPU` inference (§5.4) — YOLO detection running
+  through the OpenVINO GPU plugin on an Intel iGPU inside the container, not
+  just CPU-plugin builds.
 - **Not yet verified:** an actual build *on* aarch64 hardware, and running any
   executable against a real camera/CAN/serial/C-board. Treat the Jetson
   compatibility table in §4 as a well-checked static analysis (CMake logic,

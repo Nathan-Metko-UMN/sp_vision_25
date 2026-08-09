@@ -8,13 +8,15 @@
 #include "tools/exiter.hpp"
 #include "tools/img_tools.hpp"
 #include "tools/plotter.hpp"
+#include "tools/logger.hpp"
+#include "tools/math_tools.hpp"
 
 const std::string keys =
   "{help h usage ? |                        | 输出命令行参数说明 }"
   "{config-path c  | configs/sentry.yaml    | yaml配置文件的路径}"
   "{start-index s  | 0                      | 视频起始帧下标    }"
   "{end-index e    | 0                      | 视频结束帧下标    }"
-  "{@video_path    |                        | avi路径}"
+  "{@video_path    | assets/demo/demo.avi   | avi路径}"
   "{tradition t    |  false                 | 是否使用传统方法识别}";
 
 int main(int argc, char * argv[])
@@ -46,6 +48,7 @@ int main(int argc, char * argv[])
 
     cv::Mat img;
     std::list<auto_aim::Armor> armors;
+    auto frame_start = std::chrono::steady_clock::now();
     video.read(img);
     if (img.empty()) break;
     // cv::GaussianBlur(img, img, cv::Size(5, 5), 0, 0, cv::BORDER_DEFAULT);
@@ -69,6 +72,13 @@ int main(int argc, char * argv[])
       data["armor_3_pixel_y"] = armor.points[3].y;
       plotter.plot(data);
     }
+
+    auto frame_end = std::chrono::steady_clock::now();
+    tools::delta_time(frame_end, frame_start) * 1e3;
+        tools::logger()->info(
+      "[{}] detect: {:.1f}ms, armors: {}", frame_count,
+      tools::delta_time(frame_end, frame_start) * 1e3, armors.size());
+
 
     auto key = cv::waitKey(33);
     if (key == 'q') break;

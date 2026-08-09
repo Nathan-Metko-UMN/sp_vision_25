@@ -19,6 +19,17 @@
 #
 # ROS2-gated targets (sentry*, publish_test, subscribe_test, topic_loop_test)
 # are skipped since ROS2 isn't installed here — see JETSON_ORIN.md §5.3 to add it.
+#
+# `device: GPU` in the yaml configs means Intel's GPU plugin, which needs
+# Intel's actual compute-runtime (intel-opencl-icd / intel-level-zero-gpu),
+# not just the generic ICD loader that OpenVINO's own dependency script
+# installs. That runtime is only meaningful on x86_64 (Jetson's GPU is
+# NVIDIA, unsupported by this plugin regardless), so it's only installed
+# there. At *container run time* you still need to give the container access
+# to the host GPU:
+#   - native Linux host: `docker run --device=/dev/dri ...`
+#   - Windows host via Docker Desktop/WSL2: `docker run --device=/dev/dxg
+#     -v /usr/lib/wsl:/usr/lib/wsl ...` (see JETSON_ORIN.md appendix)
 
 FROM ubuntu:22.04
 
@@ -68,6 +79,21 @@ RUN set -eux; \
     ln -s "/opt/intel/openvino_${OPENVINO_VERSION}" /opt/intel/openvino; \
     if [ -x "/opt/intel/openvino/install_dependencies/install_openvino_dependencies.sh" ]; then \
         /opt/intel/openvino/install_dependencies/install_openvino_dependencies.sh -y || true; \
+    fi
+
+# --- Intel GPU compute runtime (needed for `device: GPU` in the yaml configs) ---
+# x86_64 only: the OpenVINO GPU plugin only ever talks to an Intel GPU, and
+# Jetson's GPU is NVIDIA, so there is nothing to install on aarch64.
+RUN set -eux; \
+    if [ "$(uname -m)" = "x86_64" ]; then \
+        apt-get update && apt-get install -y --no-install-recommends gnupg gpg-agent wget ca-certificates; \
+        wget -qO - https://repositories.intel.com/gpu/intel-graphics.key \
+            | gpg --dearmor --output /usr/share/keyrings/intel-graphics.gpg; \
+        echo 'deb [arch=amd64,i386 signed-by=/usr/share/keyrings/intel-graphics.gpg] https://repositories.intel.com/gpu/ubuntu jammy client' \
+            > /etc/apt/sources.list.d/intel-gpu-jammy.list; \
+        apt-get update; \
+        apt-get install -y --no-install-recommends intel-opencl-icd intel-level-zero-gpu level-zero clinfo; \
+        rm -rf /var/lib/apt/lists/*; \
     fi
 
 WORKDIR /root/sp_vision_25

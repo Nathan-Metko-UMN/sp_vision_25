@@ -1,0 +1,39 @@
+// For format details, see https://aka.ms/devcontainer.json. For config options, see the
+// README at: https://github.com/devcontainers/templates/tree/main/src/docker-existing-dockerfile
+{
+	"name": "Existing Dockerfile",
+	"build": {
+		// Sets the run context to one level up instead of the .devcontainer folder.
+		"context": "..",
+		// Update the 'dockerFile' property if you aren't using the standard 'Dockerfile' filename.
+		"dockerfile": "../Dockerfile"
+	},
+
+	// Give the container access to the host Intel GPU so `device: GPU` in the
+	// yaml configs works (OpenVINO's GPU plugin, Intel only).
+	//
+	// This machine runs Docker Desktop on Windows/WSL2, which has no /dev/dri
+	// passthrough -- GPU compute is instead reached through the WSL
+	// paravirtualized /dev/dxg device plus the host driver shim libraries
+	// Docker Desktop's WSL VM mirrors under /usr/lib/wsl. See JETSON_ORIN.md
+	// appendix for details, and for the native-Linux equivalent
+	// (`--device=/dev/dri` instead of this) if this repo is opened in a
+	// devcontainer on a real Linux host.
+	"runArgs": ["--device=/dev/dxg"],
+	"mounts": ["source=/usr/lib/wsl,target=/usr/lib/wsl,type=bind"]
+
+	// Features to add to the dev container. More info: https://containers.dev/features.
+	// "features": {},
+
+	// Use 'forwardPorts' to make a list of ports inside the container available locally.
+	// "forwardPorts": [],
+
+	// Uncomment the next line to run commands after the container is created.
+	// "postCreateCommand": "cat /etc/os-release",
+
+	// Configure tool-specific properties.
+	// "customizations": {},
+
+	// Uncomment to connect as an existing user other than the container default. More info: https://aka.ms/dev-containers-non-root.
+	// "remoteUser": "devcontainer"
+}
