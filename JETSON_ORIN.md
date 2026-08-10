@@ -192,6 +192,14 @@ which does not work on Jetson. For `device: CUDA`, add
 `--runtime nvidia -e NVIDIA_VISIBLE_DEVICES=all` to the `docker run` command
 above (see §5.6).
 
+**For iterative dev work on a Jetson with a monitor attached** (GPU +
+`cv::imshow` video output on the Jetson's own display + the CUDA-headers
+mount §5.7's `device: TENSORRT` needs + persistent build/engine cache across
+sessions), use `./docker_enter_jetson.sh` instead of building the `docker
+run` command by hand — see the script's own header comment for what each
+piece does and why (in particular, why it uses a mounted `.Xauthority`
+instead of `xhost`).
+
 ### 5.3 Adding ROS 2 / sentry support (optional)
 
 This repo's sentry executables require a `sp_msgs` ROS2 package that isn't
