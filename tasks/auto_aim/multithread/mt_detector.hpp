@@ -14,6 +14,7 @@
 #include <atomic>
 #include <memory>
 
+#include "tasks/auto_aim/yolos/preprocess_kernel.hpp"
 #include "tasks/auto_aim/yolos/trt_engine.hpp"
 #endif
 
@@ -58,12 +59,15 @@ private:
   // idle -- confirmed via tegrastats on real hardware (GPU averaging ~15%
   // utilization). This path instead ring-buffers every per-frame CUDA
   // resource across kTrtRingSize slots, so push() for frame N+1 can start
-  // CPU letterbox/preprocess and enqueue its own H2D/infer/D2H while frame
-  // N's are still in flight on the stream -- the CPU only ever waits
-  // (via cudaEventSynchronize on that *specific* slot's event, never a full
+  // CPU preprocess and enqueue its own H2D/kernel/infer/D2H while frame N's
+  // are still in flight on the stream -- the CPU only ever waits (via
+  // cudaEventSynchronize on that *specific* slot's event, never a full
   // cudaStreamSynchronize which would also wait for later, unrelated
   // enqueued frames) when it's about to reuse a slot whose previous
-  // occupant's GPU work hasn't finished yet.
+  // occupant's GPU work hasn't finished yet. Preprocessing itself (letterbox
+  // resize + BGR->RGB + normalize + HWC->CHW) runs as a CUDA kernel on the
+  // GPU (see preprocess_kernel.cu and YOLOV5::infer_tensorrt_gpu_preprocess,
+  // which this mirrors) rather than on the CPU.
   static constexpr int kTrtRingSize = 3;
 
   bool use_tensorrt_ = false;
@@ -84,10 +88,22 @@ private:
 
   struct TrtSlot
   {
-    void * input_device = nullptr;
+    void * input_device = nullptr;   // 640x640x3 float32 CHW -- TensorRT's input binding
     void * output_device = nullptr;
-    float * input_host = nullptr;   // pinned
+    float * input_host = nullptr;   // pinned, unused once GPU preprocessing writes input_device
+                                     // directly, but TensorRT still needs an input binding for
+                                     // setTensorAddress; kept for symmetry/debug readback.
     float * output_host = nullptr;  // pinned
+    // Raw (unresized) source frame staging, BGR uint8 HWC -- own copy per
+    // slot (not shared) because the CPU-side memcpy into raw_input_host
+    // happens synchronously in push_tensorrt() the moment it's called, but
+    // the GPU doesn't actually read it until its H2D copy executes later on
+    // the stream; sharing one buffer across slots would let push() for
+    // frame N+1 overwrite frame N's raw pixel data before the GPU has
+    // copied it. raw_input_device only needs stream-ordering (safe to
+    // share), but keeping it per-slot too avoids the asymmetry.
+    void * raw_input_device = nullptr;
+    uint8_t * raw_input_host = nullptr;  // pinned
     cudaEvent_t d2h_done = nullptr;
     // Bookkeeping only -- the real cross-thread synchronization is always
     // the cudaEvent above (safe to wait on from multiple threads per CUDA's
@@ -97,16 +113,16 @@ private:
   };
   std::array<TrtSlot, kTrtRingSize> trt_slots_;
   int trt_next_slot_ = 0;  // producer-side ring cursor, advanced only in push_tensorrt()
+  // Raw-frame buffer size (all slots share the same source resolution, so
+  // one size suffices); (re)allocated across all slots together if it
+  // changes (never, in practice, for a fixed camera/ROI).
+  int trt_raw_w_ = -1, trt_raw_h_ = -1;
 
   // {img.clone(), t, slot_index, letterbox_scale} -- FIFO order matches
   // slot-reuse order (the ring is strictly round-robin), so no separate
   // slot->queue-entry lookup is needed.
   tools::ThreadSafeQueue<std::tuple<cv::Mat, std::chrono::steady_clock::time_point, int, double>>
     trt_queue_{16, [] { tools::logger()->debug("[MultiThreadDetector] TRT queue is full!"); }};
-
-  // Persistent letterbox canvas, mirrors YOLOV5::letterbox_canvas_.
-  cv::Mat trt_letterbox_canvas_;
-  int trt_letterbox_w_ = -1, trt_letterbox_h_ = -1;
 
   void push_tensorrt(cv::Mat & img, std::chrono::steady_clock::time_point t);
   std::tuple<cv::Mat, std::chrono::steady_clock::time_point, std::list<Armor>> pop_tensorrt();

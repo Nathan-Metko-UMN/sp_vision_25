@@ -103,6 +103,8 @@ MultiThreadDetector::~MultiThreadDetector()
     if (slot.output_device) cudaFree(slot.output_device);
     if (slot.input_host) cudaFreeHost(slot.input_host);
     if (slot.output_host) cudaFreeHost(slot.output_host);
+    if (slot.raw_input_device) cudaFree(slot.raw_input_device);
+    if (slot.raw_input_host) cudaFreeHost(slot.raw_input_host);
     if (slot.d2h_done) cudaEventDestroy(slot.d2h_done);
   }
   if (trt_stream_) cudaStreamDestroy(trt_stream_);
@@ -206,38 +208,50 @@ void MultiThreadDetector::push_tensorrt(cv::Mat & img, std::chrono::steady_clock
     slot.in_flight.store(false);
   }
 
-  // letterbox (persistent-canvas pattern, mirrors YOLOV5::detect())
   auto x_scale = static_cast<double>(640) / img.rows;
   auto y_scale = static_cast<double>(640) / img.cols;
   auto scale = std::min(x_scale, y_scale);
   auto h = static_cast<int>(img.rows * scale);
   auto w = static_cast<int>(img.cols * scale);
 
+  // Lazily (re)allocate every slot's raw-frame staging buffers together --
+  // only changes if the source resolution changes (never, in practice, for
+  // a fixed camera/ROI). Mirrors YOLOV5::infer_tensorrt_gpu_preprocess.
   auto t0 = std::chrono::steady_clock::now();
-  if (trt_letterbox_canvas_.empty() || trt_letterbox_w_ != w || trt_letterbox_h_ != h) {
-    trt_letterbox_canvas_ = cv::Mat(640, 640, CV_8UC3, cv::Scalar(0, 0, 0));
-    trt_letterbox_w_ = w;
-    trt_letterbox_h_ = h;
+  if (trt_raw_w_ != img.cols || trt_raw_h_ != img.rows) {
+    size_t raw_size = static_cast<size_t>(img.cols) * img.rows * 3;
+    for (auto & s : trt_slots_) {
+      if (s.raw_input_device) cudaFree(s.raw_input_device);
+      if (s.raw_input_host) cudaFreeHost(s.raw_input_host);
+      if (cudaMalloc(&s.raw_input_device, raw_size) != cudaSuccess)
+        throw std::runtime_error("MultiThreadDetector: cudaMalloc (raw input) failed");
+      if (cudaMallocHost(reinterpret_cast<void **>(&s.raw_input_host), raw_size) != cudaSuccess)
+        throw std::runtime_error("MultiThreadDetector: cudaMallocHost (raw input) failed");
+    }
+    trt_raw_w_ = img.cols;
+    trt_raw_h_ = img.rows;
   }
-  cv::resize(img, trt_letterbox_canvas_(cv::Rect(0, 0, w, h)), {w, h});
+
+  // Copy into this slot's tightly-packed pinned staging buffer -- handles
+  // both a contiguous frame and a non-contiguous ROI-cropped view.
+  cv::Mat host_view(img.rows, img.cols, CV_8UC3, slot.raw_input_host);
+  img.copyTo(host_view);
   auto t1 = std::chrono::steady_clock::now();
 
-  // preprocess (BGR->RGB swap, u8->f32 scale, HWC->CHW) directly into this
-  // slot's pinned input buffer.
-  int blob_shape[4] = {1, 3, 640, 640};
-  cv::Mat blob(4, blob_shape, CV_32F, slot.input_host);
-  cv::dnn::blobFromImage(
-    trt_letterbox_canvas_, blob, 1.0 / 255.0, cv::Size(640, 640), cv::Scalar(), true, false, CV_32F);
-  auto t2 = std::chrono::steady_clock::now();
-
-  // H2D, infer, D2H -- all enqueued async on trt_stream_, no sync here. This
-  // slot's device buffers aren't touched by any other in-flight work (we
-  // just confirmed above that any *previous* occupant's D2H has completed),
-  // and setTensorAddress is re-pointed immediately before this enqueueV3
-  // call, so this frame's kernels read/write only this slot's addresses.
+  // H2D (raw frame), GPU preprocessing kernel (letterbox resize + BGR->RGB
+  // + normalize + HWC->CHW, see preprocess_kernel.cu), infer, D2H -- all
+  // enqueued async on trt_stream_, no sync in between. This slot's device
+  // buffers aren't touched by any other in-flight work (we just confirmed
+  // above that any *previous* occupant's D2H has completed), and
+  // setTensorAddress is re-pointed immediately before this enqueueV3 call,
+  // so this frame's kernels read/write only this slot's addresses.
+  size_t raw_size = static_cast<size_t>(img.cols) * img.rows * 3;
   cudaMemcpyAsync(
-    slot.input_device, slot.input_host, 1 * 3 * 640 * 640 * sizeof(float), cudaMemcpyHostToDevice,
-    trt_stream_);
+    slot.raw_input_device, slot.raw_input_host, raw_size, cudaMemcpyHostToDevice, trt_stream_);
+
+  launch_letterbox_preprocess(
+    static_cast<const uint8_t *>(slot.raw_input_device), img.cols, img.rows, img.cols * 3,
+    static_cast<float *>(slot.input_device), w, h, static_cast<float>(scale), trt_stream_);
 
   trt_context_->setTensorAddress(trt_input_name_.c_str(), slot.input_device);
   trt_context_->setTensorAddress(trt_output_name_.c_str(), slot.output_device);
@@ -251,11 +265,10 @@ void MultiThreadDetector::push_tensorrt(cv::Mat & img, std::chrono::steady_clock
   cudaEventRecord(slot.d2h_done, trt_stream_);
   slot.in_flight.store(true);
 
-  auto t3 = std::chrono::steady_clock::now();
+  auto t2 = std::chrono::steady_clock::now();
   auto ms = [](auto a, auto b) { return std::chrono::duration<double, std::milli>(b - a).count(); };
   tools::logger()->info(
-    "[MT-TRT-TIMING] letterbox={:.2f}ms preprocess={:.2f}ms enqueue={:.2f}ms slot={}", ms(t0, t1),
-    ms(t1, t2), ms(t2, t3), slot_idx);
+    "[MT-TRT-TIMING] memcpy={:.2f}ms dispatch={:.2f}ms slot={}", ms(t0, t1), ms(t1, t2), slot_idx);
 
   trt_queue_.push({img.clone(), t, slot_idx, scale});
 }
