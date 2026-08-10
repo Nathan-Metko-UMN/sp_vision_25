@@ -355,6 +355,8 @@ void YOLOV5::trt_build_or_load_engine(const std::string & onnx_path, const std::
 
 cv::Mat YOLOV5::infer_tensorrt(const cv::Mat & input)
 {
+  auto t0 = std::chrono::steady_clock::now();
+
   cv::Mat rgb;
   cv::cvtColor(input, rgb, cv::COLOR_BGR2RGB);
   rgb.convertTo(rgb, CV_32F, 1.0 / 255.0);
@@ -367,18 +369,32 @@ cv::Mat YOLOV5::infer_tensorrt(const cv::Mat & input)
   for (int c = 0; c < 3; c++) channels[c] = cv::Mat(640, 640, CV_32F, chw_input.ptr(c));
   cv::split(rgb, channels);
 
+  auto t1 = std::chrono::steady_clock::now();
+
   cudaMemcpyAsync(
     trt_input_device_, trt_input_host_, 1 * 3 * 640 * 640 * sizeof(float), cudaMemcpyHostToDevice,
     trt_stream_);
+  cudaStreamSynchronize(trt_stream_);
+
+  auto t2 = std::chrono::steady_clock::now();
 
   if (!trt_context_->enqueueV3(trt_stream_)) {
     throw std::runtime_error("YOLOV5: TensorRT enqueueV3 failed");
   }
+  cudaStreamSynchronize(trt_stream_);
+
+  auto t3 = std::chrono::steady_clock::now();
 
   cudaMemcpyAsync(
     trt_output_host_, trt_output_device_, 1 * 25200 * 22 * sizeof(float), cudaMemcpyDeviceToHost,
     trt_stream_);
   cudaStreamSynchronize(trt_stream_);
+
+  auto t4 = std::chrono::steady_clock::now();
+  auto ms = [](auto a, auto b) { return std::chrono::duration<double, std::milli>(b - a).count(); };
+  tools::logger()->info(
+    "[TRT-TIMING] preprocess={:.2f}ms h2d={:.2f}ms infer={:.2f}ms d2h={:.2f}ms",
+    ms(t0, t1), ms(t1, t2), ms(t2, t3), ms(t3, t4));
 
   // clone(): trt_output_host_ is a persistent buffer reused every call, so
   // the caller needs its own copy, not a view into it.
