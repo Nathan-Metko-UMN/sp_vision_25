@@ -24,6 +24,11 @@
 # devcontainer.json already uses. Without this, only the source tree that
 # existed at whatever moment `docker build` last ran stays baked into the
 # image, silently diverging from the host repo -- easy to not notice.
+#
+# QT_X11_NO_MITSHM=1 disables the X MIT-SHM (shared memory) extension for
+# GTK/highgui windows -- without it, cv::imshow crashed a few seconds in
+# with a BadAccess/MIT-SHM X error on this setup (container + this X server
+# combination doesn't get along with X11 shared memory for some reason).
 
 set -e
 
@@ -57,6 +62,7 @@ else
     -e NVIDIA_DRIVER_CAPABILITIES=all \
     -e DISPLAY="${DISPLAY}" \
     -e XAUTHORITY=/root/.Xauthority \
+    -e QT_X11_NO_MITSHM=1 \
     -v "${HOME}/.Xauthority:/root/.Xauthority:ro" \
     -v /tmp/.X11-unix:/tmp/.X11-unix:rw \
     -v "${REPO_DIR}:/root/sp_vision_25" \
