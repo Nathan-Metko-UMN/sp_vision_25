@@ -41,7 +41,6 @@ int main(int argc, char * argv[])
     tools::logger()->error("failed to open {}", video_path);
     return 1;
   }
-  int total_frames = static_cast<int>(video.get(cv::CAP_PROP_FRAME_COUNT));
 
   auto_aim::multithread::MultiThreadDetector detector(config_path, true);
 
@@ -52,12 +51,29 @@ int main(int argc, char * argv[])
   // artificial throttle, deliberately maximizes pipeline pressure to
   // actually exercise overlap/backpressure (unlike detector_video_test.cpp's
   // waitKey(33)-throttled single-threaded loop).
+  //
+  // decode= and push= are logged separately (mirroring auto_aim_test.cpp's
+  // per-stage "yolo: Xms, tracker: Yms" style) because they both run
+  // sequentially on THIS one producer thread -- video.read() here is a CPU
+  // MJPEG/H264 *file* decode, not the fast DMA buffer-grab a real
+  // io::Camera::read() does in mt_standard.cpp/mt_auto_aim_debug.cpp. If
+  // decode dominates, the whole harness's throughput ceiling is a test-file
+  // artifact having nothing to do with how fast the detection pipeline
+  // itself runs -- that's what push= isolates.
   auto producer = std::thread([&]() {
     cv::Mat frame;
+    int frame_count = 0;
     while (!exiter.exit()) {
+      auto t0 = std::chrono::steady_clock::now();
       if (!video.read(frame) || frame.empty()) break;
-      detector.push(frame, std::chrono::steady_clock::now());
+      auto t1 = std::chrono::steady_clock::now();
+      detector.push(frame, t1);
+      auto t2 = std::chrono::steady_clock::now();
+      frame_count++;
       pushed_count++;
+      tools::logger()->info(
+        "[push {}] decode={:.1f}ms push={:.1f}ms", frame_count, tools::delta_time(t1, t0) * 1e3,
+        tools::delta_time(t2, t1) * 1e3);
     }
     producer_done = true;
   });
@@ -77,8 +93,14 @@ int main(int argc, char * argv[])
     popped_count++;
     total_armors += static_cast<int>(armors.size());
 
+    // Time from push() (i.e. from when this frame was handed to the
+    // detector, not from when the video file produced it) to armors being
+    // ready --
+    // the pipeline-latency analog of auto_aim_test.cpp's per-frame
+    // "yolo: Xms" line. Includes any queue wait under backpressure, which
+    // is real end-to-end latency, not just GPU time.
     tools::logger()->info(
-      "[{}/{}] armors={} latency_since_push={:.1f}ms", popped_count, total_frames, armors.size(),
+      "[pop {}] armors={} pipeline_latency={:.1f}ms", popped_count, armors.size(),
       tools::delta_time(std::chrono::steady_clock::now(), t) * 1e3);
 
     cv::resize(img, img, {}, 0.5, 0.5);
@@ -89,8 +111,10 @@ int main(int argc, char * argv[])
 
   auto elapsed = std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
   tools::logger()->info(
-    "done: pushed={} popped={} total_armors={} elapsed={:.1f}s ({:.1f} fps)", pushed_count.load(),
-    popped_count, total_armors, elapsed, popped_count / elapsed);
+    "done: pushed={} popped={} total_armors={} elapsed={:.1f}s ({:.1f} fps -- includes video FILE "
+    "decode + imshow, NOT representative of live-camera throughput; see per-frame decode=/push=/"
+    "pipeline_latency= lines above for the actual detection-pipeline numbers)",
+    pushed_count.load(), popped_count, total_armors, elapsed, popped_count / elapsed);
 
   producer.join();
   return 0;
