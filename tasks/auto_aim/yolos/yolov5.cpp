@@ -164,18 +164,29 @@ cv::Mat YOLOV5::infer_cuda(const cv::Mat & input)
     mem_info, reinterpret_cast<float *>(chw_input.data), chw_input.total(), input_shape.data(),
     input_shape.size());
 
-  const char * input_names[] = {ort_input_name_.c_str()};
-  const char * output_names[] = {ort_output_name_.c_str()};
-  auto outputs = ort_session_->Run(
-    Ort::RunOptions{nullptr}, input_names, &input_tensor, 1, output_names, 1);
+  // Output is pre-allocated in plain host memory and bound explicitly via
+  // IOBinding, rather than using Run()'s simple API (which lets the CUDA EP
+  // auto-allocate the output value itself). On real Jetson hardware, the
+  // auto-allocated output's GetTensorData<float>() reliably segfaults even
+  // though Run() succeeds and the value's shape/metadata all come back
+  // correct -- isolated down to a minimal standalone repro outside this
+  // project, so it's a bug in this onnxruntime build's default output path,
+  // not something fixable by changing preprocessing. Binding a caller-owned
+  // CPU buffer sidesteps it entirely. 25200x22 matches this model's fixed
+  // output shape (also hardcoded via the colRange(...) calls in parse()
+  // below, so no new fragility here).
+  cv::Mat output(25200, 22, CV_32F);
+  std::array<int64_t, 3> output_shape{1, 25200, 22};
+  Ort::Value output_tensor = Ort::Value::CreateTensor<float>(
+    mem_info, reinterpret_cast<float *>(output.data), output.total(), output_shape.data(),
+    output_shape.size());
 
-  auto shape = outputs[0].GetTensorTypeAndShapeInfo().GetShape();
-  // clone(): `outputs` is destroyed when this function returns, so the
-  // caller needs its own copy.
-  return cv::Mat(
-           static_cast<int>(shape[1]), static_cast<int>(shape[2]), CV_32F,
-           const_cast<float *>(outputs[0].GetTensorData<float>()))
-    .clone();
+  Ort::IoBinding binding(*ort_session_);
+  binding.BindInput(ort_input_name_.c_str(), input_tensor);
+  binding.BindOutput(ort_output_name_.c_str(), output_tensor);
+  ort_session_->Run(Ort::RunOptions{nullptr}, binding);
+
+  return output;
 }
 #endif
 
