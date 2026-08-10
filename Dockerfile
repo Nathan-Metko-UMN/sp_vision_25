@@ -244,7 +244,7 @@ ENV LD_LIBRARY_PATH=/usr/lib/wsl/lib:$LD_LIBRARY_PATH
 WORKDIR /root/sp_vision_25
 COPY . .
 
-RUN cmake -B build -DCMAKE_BUILD_TYPE=Release \
-    && cmake --build build -j"$(nproc)"
+# RUN cmake -B build -DCMAKE_BUILD_TYPE=Release \
+#     && cmake --build build -j"$(nproc)"
 
 CMD ["/bin/bash"]
