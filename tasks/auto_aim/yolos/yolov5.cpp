@@ -190,9 +190,14 @@ std::list<Armor> YOLOV5::detect(const cv::Mat & raw_img, int frame_count)
   auto w = static_cast<int>(bgr_img.cols * scale);
 
   // preproces
+  auto t_letterbox_start = std::chrono::steady_clock::now();
   auto input = cv::Mat(640, 640, CV_8UC3, cv::Scalar(0, 0, 0));
   auto roi = cv::Rect(0, 0, w, h);
   cv::resize(bgr_img, input(roi), {w, h});
+  auto t_letterbox_done = std::chrono::steady_clock::now();
+  tools::logger()->info(
+    "[LETTERBOX-TIMING] letterbox={:.2f}ms",
+    std::chrono::duration<double, std::milli>(t_letterbox_done - t_letterbox_start).count());
 
   cv::Mat output;
 #ifdef HAVE_TENSORRT
