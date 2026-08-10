@@ -20,11 +20,6 @@
 #include <memory>
 #endif
 
-#if defined(HAVE_VPI) && defined(HAVE_TENSORRT)
-#include <vpi/Image.h>
-#include <vpi/Stream.h>
-#endif
-
 #include "tasks/auto_aim/armor.hpp"
 #include "tasks/auto_aim/detector.hpp"
 #include "tasks/auto_aim/yolo.hpp"
@@ -87,34 +82,7 @@ private:
   std::string trt_input_name_, trt_output_name_;
 
   void trt_build_or_load_engine(const std::string & onnx_path, const std::string & engine_path);
-  // input_is_rgb: true skips blobFromImage's BGR->RGB swap (the VIC
-  // preprocessing path below already hands back RGB); false (the plain CPU
-  // letterbox path) keeps the original BGR->RGB swap behavior.
-  cv::Mat infer_tensorrt(const cv::Mat & input, bool input_is_rgb = false);
-#endif
-
-#if defined(HAVE_VPI) && defined(HAVE_TENSORRT)
-  // VIC (Tegra's dedicated hardware image processor) offload for the
-  // letterbox resize, via NVIDIA VPI. VIC on this hardware only accepts
-  // RGBA8 -- not BGR8/U8 -- so the pipeline is: CPU BGR->RGBA convert (full
-  // source resolution) -> VIC rescale straight into a view of a persistent,
-  // zeroed 640x640 RGBA canvas (replicating the letterbox pad-with-black
-  // behavior in one hardware call, same as the CPU path's
-  // resize-into-black-canvas) -> CPU RGBA->RGB drop-alpha (small, 640x640
-  // only) -> normal blobFromImage normalize+CHW. See yolov5.cpp for why this
-  // is not a guaranteed win: converting the full source frame to RGBA before
-  // VIC ever sees it may cost as much as the CPU resize it replaces.
-  VPIStream vpi_stream_ = nullptr;
-  VPIImage vpi_input_ = nullptr;   // wraps rgba_full_
-  VPIImage vpi_canvas_ = nullptr;  // wraps rgba_canvas_ (640x640 RGBA8, zeroed once)
-  VPIImage vpi_canvas_view_ = nullptr;  // sub-rect view into vpi_canvas_, recreated if w_/h_ change
-  cv::Mat rgba_full_;    // persistent BGR->RGBA scratch buffer, sized to match bgr_img
-  cv::Mat rgba_canvas_;  // persistent 640x640x4 RGBA canvas backing vpi_canvas_
-  cv::Mat rgb_canvas_;   // persistent 640x640x3 RGBA->RGB (alpha dropped) buffer, feeds blobFromImage
-  int vpi_input_w_ = -1, vpi_input_h_ = -1;
-  int vpi_view_w_ = -1, vpi_view_h_ = -1;
-
-  void infer_tensorrt_vic_preprocess(const cv::Mat & bgr_img, int w, int h);
+  cv::Mat infer_tensorrt(const cv::Mat & input);
 #endif
 
   cv::Mat infer_openvino(const cv::Mat & input);

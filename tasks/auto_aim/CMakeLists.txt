@@ -35,17 +35,6 @@ find_library(TENSORRT_NVONNXPARSER_LIB nvonnxparser
 find_path(CUDA_INCLUDE_DIR cuda_runtime_api.h PATHS /usr/local/cuda/include)
 find_library(CUDA_CUDART_LIB cudart PATHS /usr/local/cuda/lib64 /usr/local/cuda/targets/aarch64-linux/lib /usr/local/cuda/targets/x86_64-linux/lib)
 
-# Optional Jetson-only preprocessing offload: NVIDIA VPI's VIC (dedicated
-# Tegra image-processor hardware block) backend, used to move the
-# device: TENSORRT path's letterbox resize off the CPU. aarch64/Jetson only
-# -- VPI is a Tegra-specific SDK, so this never resolves on x86_64 dev
-# machines and the code silently falls back to the existing CPU resize path.
-# apt's vpi3-dev package installs to /opt/nvidia/vpi3 (not the usual
-# /usr/include, /usr/lib/<triplet> apt layout), hence the explicit PATHS.
-find_path(VPI_INCLUDE_DIR vpi/OpenCVInterop.hpp PATHS /opt/nvidia/vpi3/include)
-find_library(VPI_LIB nvvpi
-    PATHS /opt/nvidia/vpi3/lib/aarch64-linux-gnu /usr/lib/aarch64-linux-gnu)
-
 add_subdirectory(planner/tinympc)
 
 add_library(auto_aim OBJECT 
@@ -85,13 +74,4 @@ if(TENSORRT_INCLUDE_DIR AND TENSORRT_NVINFER_LIB AND TENSORRT_NVONNXPARSER_LIB A
     target_link_libraries(auto_aim ${TENSORRT_NVINFER_LIB} ${TENSORRT_NVONNXPARSER_LIB} ${CUDA_CUDART_LIB})
 else()
     message(STATUS "TensorRT not found -- device: TENSORRT will not be available")
-endif()
-
-if(TENSORRT_INCLUDE_DIR AND VPI_INCLUDE_DIR AND VPI_LIB)
-    message(STATUS "VPI found -- device: TENSORRT will use VIC hardware offload for letterbox resize")
-    target_compile_definitions(auto_aim PUBLIC HAVE_VPI)
-    target_include_directories(auto_aim PUBLIC ${VPI_INCLUDE_DIR})
-    target_link_libraries(auto_aim ${VPI_LIB})
-else()
-    message(STATUS "VPI not found -- device: TENSORRT will use CPU-only letterbox resize")
 endif()
