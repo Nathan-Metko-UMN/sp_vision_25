@@ -449,18 +449,6 @@ cv::Mat YOLOV5::infer_tensorrt(const cv::Mat & input, bool input_is_rgb)
 #endif
 
 #if defined(HAVE_VPI) && defined(HAVE_TENSORRT)
-namespace
-{
-void vpi_check(VPIStatus status, const char * what)
-{
-  if (status == VPI_SUCCESS) return;
-  char msg[256];
-  vpiGetLastStatusMessage(msg, sizeof(msg));
-  throw std::runtime_error(
-    std::string("YOLOV5: ") + what + " failed: " + vpiStatusGetName(status) + ": " + msg);
-}
-}  // namespace
-
 // Fills rgb_canvas_ with the letterboxed, RGB (not BGR) result -- VIC-hardware
 // equivalent of the CPU cv::resize-into-black-canvas block in detect(). VIC on
 // this hardware only accepts RGBA8 input, so the source frame is converted to
@@ -481,10 +469,9 @@ void YOLOV5::infer_tensorrt_vic_preprocess(const cv::Mat & bgr_img, int w, int h
       vpi_input_ = nullptr;
     }
     rgba_full_.create(bgr_img.rows, bgr_img.cols, CV_8UC4);
-    vpi_check(
-      vpiImageCreateWrapperOpenCVMat(
-        rgba_full_, VPI_IMAGE_FORMAT_RGBA8, VPI_BACKEND_VIC | VPI_BACKEND_CPU, &vpi_input_),
-      "vpiImageCreateWrapperOpenCVMat (input)");
+    if (vpiImageCreateWrapperOpenCVMat(
+          rgba_full_, VPI_IMAGE_FORMAT_RGBA8, VPI_BACKEND_VIC | VPI_BACKEND_CPU, &vpi_input_) != VPI_SUCCESS)
+      throw std::runtime_error("YOLOV5: vpiImageCreateWrapperOpenCVMat (input) failed");
     vpi_input_w_ = bgr_img.cols;
     vpi_input_h_ = bgr_img.rows;
   }
@@ -494,10 +481,9 @@ void YOLOV5::infer_tensorrt_vic_preprocess(const cv::Mat & bgr_img, int w, int h
   // path's letterbox_canvas_.
   if (rgba_canvas_.empty()) {
     rgba_canvas_ = cv::Mat(640, 640, CV_8UC4, cv::Scalar(0, 0, 0, 0));
-    vpi_check(
-      vpiImageCreateWrapperOpenCVMat(
-        rgba_canvas_, VPI_IMAGE_FORMAT_RGBA8, VPI_BACKEND_VIC | VPI_BACKEND_CPU, &vpi_canvas_),
-      "vpiImageCreateWrapperOpenCVMat (canvas)");
+    if (vpiImageCreateWrapperOpenCVMat(
+          rgba_canvas_, VPI_IMAGE_FORMAT_RGBA8, VPI_BACKEND_VIC | VPI_BACKEND_CPU, &vpi_canvas_) != VPI_SUCCESS)
+      throw std::runtime_error("YOLOV5: vpiImageCreateWrapperOpenCVMat (canvas) failed");
   }
 
   // Lazily (re)create the destination view -- the sub-rectangle of the
@@ -508,7 +494,8 @@ void YOLOV5::infer_tensorrt_vic_preprocess(const cv::Mat & bgr_img, int w, int h
       vpi_canvas_view_ = nullptr;
     }
     VPIRectangleI rect{0, 0, w, h};
-    vpi_check(vpiImageCreateView(vpi_canvas_, &rect, 0, &vpi_canvas_view_), "vpiImageCreateView");
+    if (vpiImageCreateView(vpi_canvas_, &rect, 0, &vpi_canvas_view_) != VPI_SUCCESS)
+      throw std::runtime_error("YOLOV5: vpiImageCreateView failed");
     vpi_view_w_ = w;
     vpi_view_h_ = h;
   }
@@ -516,11 +503,12 @@ void YOLOV5::infer_tensorrt_vic_preprocess(const cv::Mat & bgr_img, int w, int h
   cv::cvtColor(bgr_img, rgba_full_, cv::COLOR_BGR2RGBA);
   auto t1 = std::chrono::steady_clock::now();
 
-  vpi_check(
-    vpiSubmitRescale(
-      vpi_stream_, VPI_BACKEND_VIC, vpi_input_, vpi_canvas_view_, VPI_INTERP_LINEAR, VPI_BORDER_ZERO, 0),
-    "vpiSubmitRescale");
-  vpi_check(vpiStreamSync(vpi_stream_), "vpiStreamSync");
+  if (vpiSubmitRescale(
+        vpi_stream_, VPI_BACKEND_VIC, vpi_input_, vpi_canvas_view_, VPI_INTERP_LINEAR, VPI_BORDER_ZERO, 0) !=
+      VPI_SUCCESS) {
+    throw std::runtime_error("YOLOV5: vpiSubmitRescale failed");
+  }
+  vpiStreamSync(vpi_stream_);
   auto t2 = std::chrono::steady_clock::now();
 
   // Lock/unlock around the CPU read-back: rgba_canvas_ already points at the
@@ -528,9 +516,8 @@ void YOLOV5::infer_tensorrt_vic_preprocess(const cv::Mat & bgr_img, int w, int h
   // required to guarantee VIC's writes are coherent/visible to the CPU
   // before reading them directly.
   VPIImageData canvas_data;
-  vpi_check(
-    vpiImageLockData(vpi_canvas_, VPI_LOCK_READ, VPI_IMAGE_BUFFER_HOST_PITCH_LINEAR, &canvas_data),
-    "vpiImageLockData");
+  if (vpiImageLockData(vpi_canvas_, VPI_LOCK_READ, VPI_IMAGE_BUFFER_HOST_PITCH_LINEAR, &canvas_data) != VPI_SUCCESS)
+    throw std::runtime_error("YOLOV5: vpiImageLockData failed");
   cv::cvtColor(rgba_canvas_, rgb_canvas_, cv::COLOR_RGBA2RGB);
   vpiImageUnlock(vpi_canvas_);
 
