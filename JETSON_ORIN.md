@@ -427,26 +427,73 @@ development headers/libs, `libnvinfer-dev`/`libnvinfer-plugin-dev`/
 `libnvonnxparsers-dev`. On the reference Jetson device, TensorRT 10.3's
 *runtime* was already present (JetPack ships it), these packages just add
 the matching dev headers on top. `tasks/auto_aim/CMakeLists.txt` looks for
-`NvInfer.h`/`libnvinfer`/`libnvonnxparser` plus the CUDA runtime at
-standard system paths; if missing, the project still builds fine, just
-without `device: TENSORRT` support (same graceful-absence pattern as
-`device: CUDA`'s onnxruntime detection).
+`NvInfer.h`/`libnvinfer`/`libnvonnxparser` under both Debian/Ubuntu
+multiarch triplet paths (`/usr/include/aarch64-linux-gnu`,
+`/usr/lib/aarch64-linux-gnu`, and the `x86_64` equivalents) as well as
+plain `/usr/include`/`/usr/lib` — apt installs these under the multiarch
+paths, which CMake's bare `find_path`/`find_library` doesn't reliably
+search without an explicit hint. If TensorRT isn't found, the project still
+builds fine, just without `device: TENSORRT` support (same graceful-absence
+pattern as `device: CUDA`'s onnxruntime detection).
 
-**Status: implemented, not yet run on real hardware.** Written against
-TensorRT 10.3's C++ API (the version confirmed on the reference Jetson
-device — `enqueueV3`/`setTensorAddress`/tensor-name-based I/O, the current
-API as of TensorRT 8.5+, replacing the older binding-index/`enqueueV2` API)
-but not yet built or executed there. The next thing to verify: does
-`sudo docker build` succeed with the new TensorRT dev packages, does the
-engine actually build from `assets/yolov5.onnx` on device, and — the
-interesting number — how much faster is `configs/demo_tensorrt.yaml`
-(a copy of `demo.yaml` with `device: TENSORRT`) than `demo_cuda.yaml`'s
-40-55ms/frame.
+**A real gap the Dockerfile doesn't currently close: CUDA's own C headers
+(`cuda_runtime_api.h`), needed to compile TensorRT's API usage, aren't
+installed by anything in the Jetson apt repo.** Unlike desktop CUDA repos,
+which split a `cuda-cudart-dev-*` header-only package out from the runtime,
+the Jetson/L4T repo used here has no such package -- confirmed via
+`apt-cache search cuda-cudart` (only the runtime `cuda-cudart-12-6` exists,
+and it ships zero `.h` files) and `apt-cache policy cuda-toolkit-12-6`
+(doesn't exist either). What worked: the Jetson **host** already has a
+complete `/usr/local/cuda-12.6/include` (from JetPack's own SDK-Manager
+flash, entirely separate from anything apt-installed inside the container) —
+bind-mounting that in at container run time, same pattern as the
+Windows/WSL2 `/usr/lib/wsl` mount elsewhere in this doc, closes the gap:
+```
+docker run ... -v /usr/local/cuda-12.6:/usr/local/cuda-12.6:ro ...
+```
+This is a workaround, not a real fix baked into the Dockerfile — if you're
+on a different JetPack/L4T version, adjust the `12.6` to match, and if the
+host's own CUDA install is somehow incomplete this won't help. A more
+robust fix (not yet done) would find or build a genuine apt-installable
+header package for this repo, or vendor the small set of needed headers
+directly into the image.
+
+**Status: confirmed working end-to-end on real Jetson Orin hardware,
+including the expected large speedup over `device: CUDA`.** With the CMake
+multiarch paths and CUDA-headers bind-mount above,
+`configs/demo_tensorrt.yaml` ran cleanly with `platformHasFastFp16=1`
+(FP16 genuinely active) and a cached `assets/yolov5.engine` reused across
+runs. Per-stage timing (added temporarily, since removed) broke the
+`infer_tensorrt()` call down as preprocess ~1.3ms, host-to-device copy
+~0.7ms, TensorRT inference ~3.4ms, device-to-host copy ~0.5ms — full
+`yolo:` (inference + postprocess/NMS) landed at **~10-13ms/frame**, versus
+`device: CUDA`'s ~40-55ms. That's roughly the 4-5x speedup expected from
+FP16 + kernel autotuning, once one more thing was fixed:
+
+**Critical, easy-to-miss step: run `sudo jetson_clocks` on the host.**
+Initial TensorRT numbers were a disappointing ~28-35ms/frame -- barely
+faster than `device: CUDA` -- even with the power mode already at
+`MAXN_SUPER` (`nvpmodel -q`). `MAXN_SUPER` just permits maximum clocks;
+it does not *hold* them there, so short bursty GPU workloads (exactly what
+per-frame inference is) can spend real time at reduced clock speed while
+DVFS ramps up. `sudo jetson_clocks` locks clocks at their maximum and
+disables that ramping -- after running it, `infer` time alone dropped from
+~10-15ms to ~3.3-4.9ms with no code changes. This isn't specific to
+`device: TENSORRT` (it would help `device: CUDA` too), but it's the kind of
+thing worth doing *before* concluding a GPU backend "isn't much faster" on
+Jetson -- verify clocks are actually locked first.
 
 ## 6. Known gaps / things to verify on real hardware
 
-- `device: TENSORRT` (§5.7) is implemented but not yet run on real
-  hardware — see the status note at the end of §5.7.
+- `device: TENSORRT` (§5.7) needs `/usr/local/cuda-12.6` bind-mounted from
+  the host at container run time to compile at all (`-v
+  /usr/local/cuda-12.6:/usr/local/cuda-12.6:ro`) -- the Jetson apt repo has
+  no package providing CUDA's own C headers. Not baked into the Dockerfile;
+  see §5.7 for why and what a real fix would look like.
+- Whenever GPU performance on Jetson looks disappointing, check
+  `sudo jetson_clocks` has been run before assuming the code/model is the
+  problem -- see §5.7, this alone was a ~3x difference for `device:
+  TENSORRT`.
 - `device: CUDA` (§5.5/§5.6) and `device: TENSORRT` (§5.7) only have a
   working ONNX export for `yolov5` — the model every shipped config
   actually uses. `yolo11`/`yolov8` don't have a CUDA or TensorRT path.

@@ -63,13 +63,21 @@
 #
 # `device: TENSORRT` is a third GPU backend, NVIDIA only, using TensorRT's
 # own C++ API directly instead of going through ONNX Runtime at all --
-# expected to be substantially faster than `device: CUDA` for the same
-# model (FP16 + kernel-level autotuning for the exact GPU), though not yet
-# benchmarked on real hardware -- see JETSON_ORIN.md §5.7 for status. Costs
-# a one-time engine build per device (minutes) the first time a config
-# using it runs. `libnvinfer-dev`/`libnvonnxparsers-dev` (TensorRT's
-# build-time headers/libs) are installed alongside the CUDA runtime above,
-# from the same repo (desktop vs Jetson/L4T) and same architecture gating.
+# confirmed on real Jetson hardware at ~10-13ms/frame vs `device: CUDA`'s
+# ~40-55ms (FP16 + kernel-level autotuning for the exact GPU) -- see
+# JETSON_ORIN.md §5.7, including a critical `sudo jetson_clocks` step on the
+# host without which that gap mostly disappears. Costs a one-time engine
+# build per device (minutes) the first time a config using it runs.
+# `libnvinfer-dev`/`libnvonnxparsers-dev` (TensorRT's build-time
+# headers/libs) are installed alongside the CUDA runtime above, from the
+# same repo (desktop vs Jetson/L4T) and same architecture gating. NOTE:
+# on Jetson this is still not quite self-contained -- the Jetson apt repo
+# has no package providing CUDA's own C headers (cuda_runtime_api.h etc,
+# needed to compile TensorRT API usage), so compiling `device: TENSORRT`
+# there additionally requires bind-mounting the host's own
+# /usr/local/cuda-12.6 (from JetPack's SDK-Manager flash) at container run
+# time -- see JETSON_ORIN.md §5.7 for the full explanation and the exact
+# mount flag.
 
 FROM ubuntu:22.04
 

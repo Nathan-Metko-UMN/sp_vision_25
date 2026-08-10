@@ -319,7 +319,9 @@ void YOLOV5::trt_build_or_load_engine(const std::string & onnx_path, const std::
   std::unique_ptr<nvinfer1::IBuilderConfig> config(builder->createBuilderConfig());
   if (!config) throw std::runtime_error("YOLOV5: failed to create TensorRT builder config");
   config->setMemoryPoolLimit(nvinfer1::MemoryPoolType::kWORKSPACE, 1ULL << 30);
-  if (builder->platformHasFastFp16()) config->setFlag(nvinfer1::BuilderFlag::kFP16);
+  bool fp16_supported = builder->platformHasFastFp16();
+  tools::logger()->info("YOLOV5: TensorRT platformHasFastFp16={}", fp16_supported);
+  if (fp16_supported) config->setFlag(nvinfer1::BuilderFlag::kFP16);
 
   std::unique_ptr<nvinfer1::IHostMemory> serialized(builder->buildSerializedNetwork(*network, *config));
   if (!serialized) throw std::runtime_error("YOLOV5: TensorRT engine build failed");
