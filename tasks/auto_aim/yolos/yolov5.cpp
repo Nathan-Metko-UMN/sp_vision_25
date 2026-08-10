@@ -342,7 +342,7 @@ cv::Mat YOLOV5::infer_tensorrt_gpu_preprocess(const cv::Mat & bgr_img, int w, in
 
   launch_letterbox_preprocess(
     static_cast<const uint8_t *>(trt_raw_input_device_), bgr_img.cols, bgr_img.rows, bgr_img.cols * 3,
-    trt_input_device_, w, h, static_cast<float>(scale), trt_stream_);
+    static_cast<float *>(trt_input_device_), w, h, static_cast<float>(scale), trt_stream_);
   auto t2 = std::chrono::steady_clock::now();
 
   if (!trt_context_->enqueueV3(trt_stream_)) {
