@@ -12,6 +12,12 @@
 #include <NvOnnxParser.h>
 #endif
 
+#if defined(HAVE_VPI) && defined(HAVE_TENSORRT)
+#include <vpi/Interpolation.h>
+#include <vpi/OpenCVInterop.hpp>
+#include <vpi/algo/Rescale.h>
+#endif
+
 #include "tools/img_tools.hpp"
 #include "tools/logger.hpp"
 
@@ -121,7 +127,13 @@ YOLOV5::YOLOV5(const std::string & config_path, bool debug)
     trt_context_->setTensorAddress(trt_input_name_.c_str(), trt_input_device_);
     trt_context_->setTensorAddress(trt_output_name_.c_str(), trt_output_device_);
 
+#if defined(HAVE_VPI)
+    if (vpiStreamCreate(0, &vpi_stream_) != VPI_SUCCESS)
+      throw std::runtime_error("YOLOV5: vpiStreamCreate failed");
+    tools::logger()->info("YOLOV5: using TensorRT backend, engine={}, VIC-accelerated letterbox", engine_path);
+#else
     tools::logger()->info("YOLOV5: using TensorRT backend, engine={}", engine_path);
+#endif
 #else
     throw std::runtime_error(
       "device: TENSORRT requires building with TensorRT support, but TensorRT "
@@ -161,6 +173,12 @@ YOLOV5::~YOLOV5()
   if (trt_output_host_) cudaFreeHost(trt_output_host_);
   if (trt_stream_) cudaStreamDestroy(trt_stream_);
 #endif
+#if defined(HAVE_VPI) && defined(HAVE_TENSORRT)
+  if (vpi_canvas_view_) vpiImageDestroy(vpi_canvas_view_);
+  if (vpi_canvas_) vpiImageDestroy(vpi_canvas_);
+  if (vpi_input_) vpiImageDestroy(vpi_input_);
+  if (vpi_stream_) vpiStreamDestroy(vpi_stream_);
+#endif
 }
 
 std::list<Armor> YOLOV5::detect(const cv::Mat & raw_img, int frame_count)
@@ -189,40 +207,51 @@ std::list<Armor> YOLOV5::detect(const cv::Mat & raw_img, int frame_count)
   auto h = static_cast<int>(bgr_img.rows * scale);
   auto w = static_cast<int>(bgr_img.cols * scale);
 
-  // preproces
-  //
-  // letterbox_canvas_ is reused across frames instead of allocating +
-  // zero-filling a fresh buffer every call: for a fixed camera/ROI, w/h
-  // (and therefore the padding region) never change frame to frame, so the
-  // zero-fill only actually needs to happen once. Only re-zeroed if the
-  // computed size changed (first frame, or the source resolution changed).
-  auto t_letterbox_start = std::chrono::steady_clock::now();
-  if (letterbox_canvas_.empty() || letterbox_w_ != w || letterbox_h_ != h) {
-    letterbox_canvas_ = cv::Mat(640, 640, CV_8UC3, cv::Scalar(0, 0, 0));
-    letterbox_w_ = w;
-    letterbox_h_ = h;
-  }
-  auto roi = cv::Rect(0, 0, w, h);
-  cv::resize(bgr_img, letterbox_canvas_(roi), {w, h});
-  auto & input = letterbox_canvas_;
-  auto t_letterbox_done = std::chrono::steady_clock::now();
-  tools::logger()->info(
-    "[LETTERBOX-TIMING] letterbox={:.2f}ms",
-    std::chrono::duration<double, std::milli>(t_letterbox_done - t_letterbox_start).count());
-
   cv::Mat output;
-#ifdef HAVE_TENSORRT
+#if defined(HAVE_VPI) && defined(HAVE_TENSORRT)
   if (use_tensorrt_) {
-    output = infer_tensorrt(input);
-  } else
-#endif
-#ifdef HAVE_ONNXRUNTIME
-  if (use_cuda_) {
-    output = infer_cuda(input);
+    // VIC-accelerated letterbox: see infer_tensorrt_vic_preprocess and the
+    // member comments in yolov5.hpp for why this replaces the CPU resize
+    // below instead of just being an addition to it.
+    infer_tensorrt_vic_preprocess(bgr_img, w, h);
+    output = infer_tensorrt(rgb_canvas_, true);
   } else
 #endif
   {
-    output = infer_openvino(input);
+    // preproces
+    //
+    // letterbox_canvas_ is reused across frames instead of allocating +
+    // zero-filling a fresh buffer every call: for a fixed camera/ROI, w/h
+    // (and therefore the padding region) never change frame to frame, so the
+    // zero-fill only actually needs to happen once. Only re-zeroed if the
+    // computed size changed (first frame, or the source resolution changed).
+    auto t_letterbox_start = std::chrono::steady_clock::now();
+    if (letterbox_canvas_.empty() || letterbox_w_ != w || letterbox_h_ != h) {
+      letterbox_canvas_ = cv::Mat(640, 640, CV_8UC3, cv::Scalar(0, 0, 0));
+      letterbox_w_ = w;
+      letterbox_h_ = h;
+    }
+    auto roi = cv::Rect(0, 0, w, h);
+    cv::resize(bgr_img, letterbox_canvas_(roi), {w, h});
+    auto & input = letterbox_canvas_;
+    auto t_letterbox_done = std::chrono::steady_clock::now();
+    tools::logger()->info(
+      "[LETTERBOX-TIMING] letterbox={:.2f}ms",
+      std::chrono::duration<double, std::milli>(t_letterbox_done - t_letterbox_start).count());
+
+#ifdef HAVE_TENSORRT
+    if (use_tensorrt_) {
+      output = infer_tensorrt(input, false);
+    } else
+#endif
+#ifdef HAVE_ONNXRUNTIME
+    if (use_cuda_) {
+      output = infer_cuda(input);
+    } else
+#endif
+    {
+      output = infer_openvino(input);
+    }
   }
 
   auto t_infer_done = std::chrono::steady_clock::now();
@@ -369,12 +398,13 @@ void YOLOV5::trt_build_or_load_engine(const std::string & onnx_path, const std::
   if (!trt_engine_) throw std::runtime_error("YOLOV5: failed to deserialize freshly-built TensorRT engine");
 }
 
-cv::Mat YOLOV5::infer_tensorrt(const cv::Mat & input)
+cv::Mat YOLOV5::infer_tensorrt(const cv::Mat & input, bool input_is_rgb)
 {
   auto t0 = std::chrono::steady_clock::now();
 
-  // cv::dnn::blobFromImage fuses BGR->RGB swap, u8->f32 scale, and
-  // HWC->CHW channel splitting into one optimized call, replacing a
+  // cv::dnn::blobFromImage fuses the BGR->RGB swap (skipped when the caller
+  // already handed us RGB, e.g. the VIC preprocessing path), u8->f32 scale,
+  // and HWC->CHW channel splitting into one optimized call, replacing a
   // 3-separate-full-image-pass chain (cvtColor + convertTo + split) that
   // measured as a meaningful per-frame cost. `blob` wraps trt_input_host_
   // (the persistent pinned buffer) directly with the exact target shape, so
@@ -382,7 +412,8 @@ cv::Mat YOLOV5::infer_tensorrt(const cv::Mat & input)
   // matches and writes straight into it rather than allocating its own.
   int blob_shape[4] = {1, 3, 640, 640};
   cv::Mat blob(4, blob_shape, CV_32F, trt_input_host_);
-  cv::dnn::blobFromImage(input, blob, 1.0 / 255.0, cv::Size(640, 640), cv::Scalar(), true, false, CV_32F);
+  cv::dnn::blobFromImage(
+    input, blob, 1.0 / 255.0, cv::Size(640, 640), cv::Scalar(), !input_is_rgb, false, CV_32F);
 
   auto t1 = std::chrono::steady_clock::now();
 
@@ -414,6 +445,86 @@ cv::Mat YOLOV5::infer_tensorrt(const cv::Mat & input)
   // clone(): trt_output_host_ is a persistent buffer reused every call, so
   // the caller needs its own copy, not a view into it.
   return cv::Mat(25200, 22, CV_32F, trt_output_host_).clone();
+}
+#endif
+
+#if defined(HAVE_VPI) && defined(HAVE_TENSORRT)
+// Fills rgb_canvas_ with the letterboxed, RGB (not BGR) result -- VIC-hardware
+// equivalent of the CPU cv::resize-into-black-canvas block in detect(). VIC on
+// this hardware only accepts RGBA8 input, so the source frame is converted to
+// RGBA on the CPU first (bgr2rgba, below), then VIC rescales it directly into
+// a view of a persistent zeroed 640x640 RGBA canvas (replicating the
+// resize+pad-with-black behavior in one hardware call), then a final CPU
+// RGBA->RGB drop-alpha (small, 640x640 only) produces the RGB image
+// infer_tensorrt's blobFromImage call expects.
+void YOLOV5::infer_tensorrt_vic_preprocess(const cv::Mat & bgr_img, int w, int h)
+{
+  auto t0 = std::chrono::steady_clock::now();
+
+  // Lazily (re)create the input wrapper -- only changes if the source
+  // resolution changes (never, in practice, for a fixed camera/ROI).
+  if (vpi_input_w_ != bgr_img.cols || vpi_input_h_ != bgr_img.rows) {
+    if (vpi_input_) {
+      vpiImageDestroy(vpi_input_);
+      vpi_input_ = nullptr;
+    }
+    rgba_full_.create(bgr_img.rows, bgr_img.cols, CV_8UC4);
+    if (vpiImageCreateWrapperOpenCVMat(
+          rgba_full_, VPI_IMAGE_FORMAT_RGBA8, VPI_BACKEND_VIC | VPI_BACKEND_CPU, &vpi_input_) != VPI_SUCCESS)
+      throw std::runtime_error("YOLOV5: vpiImageCreateWrapperOpenCVMat (input) failed");
+    vpi_input_w_ = bgr_img.cols;
+    vpi_input_h_ = bgr_img.rows;
+  }
+
+  // Lazily allocate the persistent 640x640 RGBA canvas + its VPI wrapper,
+  // zeroed once so the letterbox padding stays black exactly like the CPU
+  // path's letterbox_canvas_.
+  if (rgba_canvas_.empty()) {
+    rgba_canvas_ = cv::Mat(640, 640, CV_8UC4, cv::Scalar(0, 0, 0, 0));
+    if (vpiImageCreateWrapperOpenCVMat(
+          rgba_canvas_, VPI_IMAGE_FORMAT_RGBA8, VPI_BACKEND_VIC | VPI_BACKEND_CPU, &vpi_canvas_) != VPI_SUCCESS)
+      throw std::runtime_error("YOLOV5: vpiImageCreateWrapperOpenCVMat (canvas) failed");
+  }
+
+  // Lazily (re)create the destination view -- the sub-rectangle of the
+  // canvas VIC actually writes into -- only when w/h change.
+  if (vpi_view_w_ != w || vpi_view_h_ != h) {
+    if (vpi_canvas_view_) {
+      vpiImageDestroy(vpi_canvas_view_);
+      vpi_canvas_view_ = nullptr;
+    }
+    VPIRectangleI rect{0, 0, w, h};
+    if (vpiImageCreateView(vpi_canvas_, &rect, 0, &vpi_canvas_view_) != VPI_SUCCESS)
+      throw std::runtime_error("YOLOV5: vpiImageCreateView failed");
+    vpi_view_w_ = w;
+    vpi_view_h_ = h;
+  }
+
+  cv::cvtColor(bgr_img, rgba_full_, cv::COLOR_BGR2RGBA);
+  auto t1 = std::chrono::steady_clock::now();
+
+  if (vpiSubmitRescale(
+        vpi_stream_, VPI_BACKEND_VIC, vpi_input_, vpi_canvas_view_, VPI_INTERP_LINEAR, VPI_BORDER_ZERO, 0) !=
+      VPI_SUCCESS) {
+    throw std::runtime_error("YOLOV5: vpiSubmitRescale failed");
+  }
+  vpiStreamSync(vpi_stream_);
+  auto t2 = std::chrono::steady_clock::now();
+
+  // Lock/unlock around the CPU read-back: rgba_canvas_ already points at the
+  // same memory vpi_canvas_ wraps, but per VPI's documented contract this is
+  // required to guarantee VIC's writes are coherent/visible to the CPU
+  // before reading them directly.
+  VPIImageData canvas_data;
+  if (vpiImageLockData(vpi_canvas_, VPI_LOCK_READ, VPI_IMAGE_BUFFER_HOST_PITCH_LINEAR, &canvas_data) != VPI_SUCCESS)
+    throw std::runtime_error("YOLOV5: vpiImageLockData failed");
+  cv::cvtColor(rgba_canvas_, rgb_canvas_, cv::COLOR_RGBA2RGB);
+  vpiImageUnlock(vpi_canvas_);
+
+  auto t3 = std::chrono::steady_clock::now();
+  auto ms = [](auto a, auto b) { return std::chrono::duration<double, std::milli>(b - a).count(); };
+  tools::logger()->info(
+    "[VIC-TIMING] bgr2rgba={:.2f}ms rescale={:.2f}ms rgba2rgb={:.2f}ms", ms(t0, t1), ms(t1, t2), ms(t2, t3));
 }
 #endif
 
