@@ -196,16 +196,16 @@ void MultiThreadDetector::push_tensorrt(cv::Mat & img, std::chrono::steady_clock
   trt_next_slot_ = (trt_next_slot_ + 1) % kTrtRingSize;
   auto & slot = trt_slots_[slot_idx];
 
-  // Backpressure: this slot's buffers are still owned by whatever frame
-  // last used it until the GPU has actually finished with them. Wait
-  // (NOT cudaStreamSynchronize -- that would also wait for later-enqueued,
-  // unrelated frames) only if this specific slot still has work in flight.
-  // On a healthy pipeline (ring size > frames-in-flight) this is a
-  // near-instant no-op; it only actually stalls the producer if pop() is
-  // falling behind, which is the correct, intentional backpressure.
-  if (slot.in_flight.load()) {
-    cudaEventSynchronize(slot.d2h_done);
-    slot.in_flight.store(false);
+  // Backpressure: block until pop_tensorrt() has fully finished reading
+  // this slot's *previous* occupant -- GPU completion (d2h_done) alone is
+  // not enough to prove that, only that the GPU is done, not that the
+  // consumer thread has read the result out yet. See the in_flight/
+  // trt_slot_mutex_ comment in mt_detector.hpp for why this distinction is
+  // load-bearing here (it wasn't before GPU-side preprocessing made push()
+  // fast enough to race ahead of a slower consumer).
+  {
+    std::unique_lock<std::mutex> lock(trt_slot_mutex_);
+    trt_slot_cv_.wait(lock, [&] { return !slot.in_flight.load(); });
   }
 
   auto x_scale = static_cast<double>(640) / img.rows;
@@ -283,13 +283,22 @@ MultiThreadDetector::pop_tensorrt()
   // would incorrectly also block on later frames' work the producer thread
   // may have already enqueued by now.
   cudaEventSynchronize(slot.d2h_done);
-  slot.in_flight.store(false);
 
-  // View, not clone: postprocess() below consumes it synchronously, and
-  // this slot can't be reused (push_tensorrt only advances trt_next_slot_
-  // round-robin, kTrtRingSize-1 pushes away) before this function returns.
+  // View, not clone: consumed synchronously by postprocess() right below,
+  // and the slot is provably still ours -- in_flight (and therefore
+  // push_tensorrt()'s ability to reuse this slot) isn't cleared until after
+  // this line runs.
   cv::Mat output(25200, 22, CV_32F, slot.output_host);
   auto armors = yolo_.postprocess(scale, output, img, 0);  //暂不支持ROI
+
+  // Only now is this slot truly free -- wake any push_tensorrt() call
+  // blocked waiting to reuse it (see the wait in push_tensorrt() and the
+  // in_flight/trt_slot_mutex_ comment in mt_detector.hpp).
+  {
+    std::lock_guard<std::mutex> lock(trt_slot_mutex_);
+    slot.in_flight.store(false);
+  }
+  trt_slot_cv_.notify_all();
 
   return {img, t, std::move(armors)};
 }

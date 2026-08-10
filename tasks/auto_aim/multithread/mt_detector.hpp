@@ -12,7 +12,9 @@
 
 #include <array>
 #include <atomic>
+#include <condition_variable>
 #include <memory>
+#include <mutex>
 
 #include "tasks/auto_aim/yolos/preprocess_kernel.hpp"
 #include "tasks/auto_aim/yolos/trt_engine.hpp"
@@ -105,13 +107,28 @@ private:
     void * raw_input_device = nullptr;
     uint8_t * raw_input_host = nullptr;  // pinned
     cudaEvent_t d2h_done = nullptr;
-    // Bookkeeping only -- the real cross-thread synchronization is always
-    // the cudaEvent above (safe to wait on from multiple threads per CUDA's
-    // own docs); atomic just removes any ambiguity about this flag itself
-    // being read/written from both push_tensorrt() and pop_tensorrt().
+    // True from the moment push_tensorrt() dispatches this slot's GPU work
+    // until pop_tensorrt() has *fully read* its result (not merely until
+    // the GPU finishes -- see trt_slot_mutex_/trt_slot_cv_ below for why
+    // that distinction matters). Only ever cleared by pop_tensorrt().
     std::atomic<bool> in_flight{false};
   };
   std::array<TrtSlot, kTrtRingSize> trt_slots_;
+  // Guards in_flight transitions and backs the wait/notify push_tensorrt()
+  // uses when it's about to reuse a slot still in flight. GPU-completion
+  // (cudaEventSynchronize on d2h_done) alone is NOT sufficient backpressure
+  // here: with GPU-side preprocessing, push() got fast enough (~2ms) that
+  // it can race many frames ahead of a slower consumer (postprocess +
+  // imshow/waitKey), reusing a slot's buffers -- since GPU work for that
+  // slot already finished -- before pop() has actually read the *previous*
+  // occupant's data out of it, silently overwriting an unconsumed result
+  // with a newer one. This actually happened: with kTrtRingSize=3 and no
+  // proper backpressure, average pipeline_latency ballooned to 260ms+ from
+  // queue backlog, and (worse) popped results could have been silently
+  // wrong. push_tensorrt() must block until pop_tensorrt() -- not just the
+  // GPU -- is done with a slot before reusing it.
+  std::mutex trt_slot_mutex_;
+  std::condition_variable trt_slot_cv_;
   int trt_next_slot_ = 0;  // producer-side ring cursor, advanced only in push_tensorrt()
   // Raw-frame buffer size (all slots share the same source resolution, so
   // one size suffices); (re)allocated across all slots together if it
