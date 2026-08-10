@@ -355,14 +355,33 @@ suite pinned in the Dockerfile (`r36.4`) needs to match — check
 device and adjust the `r36.4` in the Dockerfile's Jetson CUDA block
 accordingly.
 
-**Status: reached real GPU inference on hardware, still debugging a
-missing-library error.** This was iterated against an actual Jetson Orin
-Nano (not simulated) through several rounds: first hit an OpenVINO
-`device: GPU`-not-registered error (expected — that's the Intel-only plugin,
-§4), then a `libcublasLt.so.12` load failure (from the wrong assumption
-above — being fixed by baking CUDA in directly instead of relying on
-`--runtime nvidia` mounts). Update this section once the corrected
-Dockerfile has been confirmed working end-to-end.
+**One more bug, found and fixed on real hardware: an onnxruntime CUDA EP
+output-retrieval crash.** After fixing the CUDA/cuDNN install (above), a new
+SIGSEGV showed up — not at startup, but on the very first inference call.
+Bisected with fine-grained tracing added directly to `infer_cuda()` (rebuilt
+in-place inside a live container, much faster than a full image rebuild per
+iteration) down to one exact line: `ort_session_->Run(...)` completes
+successfully — correct output shape `[1, 25200, 22]`, correct element count,
+`IsTensor()` true — but calling `GetTensorData<float>()` on the
+auto-allocated output `Ort::Value` segfaults. Reproduced in an ~18-line
+standalone program outside the whole project, confirmed identical
+(byte-for-byte matching library, via `md5sum`) whether the onnxruntime wheel
+came from `ultralytics/assets` or `pypi.jetson-ai-lab.io` — this is a bug in
+the wheel's build itself, not a preprocessing or project-code issue. Tried
+switching to the bundled TensorRT execution provider instead, which hit a
+different problem (GPU memory allocation failure during engine autotuning —
+plausibly just this device's limited shared memory) and wasn't pursued
+further. The fix that worked: **explicit `Ort::IoBinding` with a
+caller-owned CPU output buffer**, instead of `Run()`'s simple API which lets
+the CUDA EP allocate the output value itself — sidesteps whatever's broken
+in that default allocation path entirely. Verified via the same standalone
+repro before applying to `yolov5.cpp`'s `infer_cuda()`.
+
+**Status: fix verified in an isolated standalone repro on real Jetson Orin
+hardware; not yet re-confirmed through the full rebuilt project.** The
+IOBinding fix produced a correct output value in the minimal repro before
+being applied to `yolov5.cpp`. Update this line once `auto_aim_test` against
+`configs/demo_cuda.yaml` has been run end-to-end with the fix in place.
 
 ## 6. Known gaps / things to verify on real hardware
 
