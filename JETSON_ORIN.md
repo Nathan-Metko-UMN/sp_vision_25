@@ -377,19 +377,79 @@ the CUDA EP allocate the output value itself — sidesteps whatever's broken
 in that default allocation path entirely. Verified via the same standalone
 repro before applying to `yolov5.cpp`'s `infer_cuda()`.
 
-**Status: fix verified in an isolated standalone repro on real Jetson Orin
-hardware; not yet re-confirmed through the full rebuilt project.** The
-IOBinding fix produced a correct output value in the minimal repro before
-being applied to `yolov5.cpp`. Update this line once `auto_aim_test` against
-`configs/demo_cuda.yaml` has been run end-to-end with the fix in place.
+**Status: confirmed working end-to-end on real Jetson Orin hardware.**
+`auto_aim_test` against `configs/demo_cuda.yaml` ran cleanly through 100+
+frames after the IOBinding fix, all `[N] yolo: ...` log lines present, no
+crash — at roughly 40-55ms/frame. (One gotcha hit along the way, worth
+recording: after fixing the source, a rebuilt image still showed the old
+crash twice in a row — traced to the *host's* working-tree copy of
+`yolov5.cpp` having uncommitted local edits that `docker build` picks up
+over whatever's committed to git, since it builds from the working
+directory, not `HEAD`. `git status`/`git diff` on the host is the first
+thing to check if a Dockerfile-based rebuild doesn't seem to reflect a
+just-pushed fix.)
+
+### 5.7 TensorRT backend (`device: TENSORRT`) — faster than `device: CUDA`
+
+~40-55ms/frame from §5.6 is fine for a first working GPU path, but slow for
+real-time auto-aim, and generic CUDA-EP execution isn't why you'd reach for
+a Jetson in the first place. `device: TENSORRT` is a third YOLOV5 backend,
+using TensorRT's own C++ API directly (`NvInfer.h`/`NvOnnxParser.h`) instead
+of going through ONNX Runtime at all — sidesteps both the output-retrieval
+bug in §5.6 (different library entirely) and ONNX Runtime's own TensorRT
+execution provider, which hit a GPU-memory allocation failure during engine
+autotuning when tried as part of debugging §5.6 (not pursued further, since
+the native API avoids it and is the standard, most-tuned path anyway — the
+same approach the
+[Ultralytics Jetson guide](https://docs.ultralytics.com/guides/nvidia-jetson)
+uses).
+
+**How it works:** same `assets/yolov5.onnx` as `device: CUDA` (§5.5/§5.6),
+but on first use with `device: TENSORRT`, `YOLOV5`'s constructor builds a
+TensorRT engine from it in-process (via `IBuilder`/`INetworkDefinition`/
+`nvonnxparser::IParser`, FP16 enabled when the platform supports it) and
+caches the serialized result to `assets/yolov5.engine` — subsequent runs
+just deserialize that cached file (fast) instead of rebuilding. **The
+engine file is tied to the exact GPU + TensorRT + CUDA version it was built
+on** (unlike the portable `.onnx`/`.xml` models) — it won't load on a
+different device or after a TensorRT/JetPack upgrade; delete the stale
+`.engine` file to force a rebuild (the code detects a failed deserialize and
+says so in the error message). The first run on any given device will be
+slow (engine building/autotuning can take several minutes) — that delay is
+a one-time cost per device, not per container restart, as long as
+`assets/` (or wherever the `.engine` ends up) persists across runs (e.g.
+via the same bind-mounted `configs`/`assets` pattern already used
+elsewhere, or simply not deleting/recreating the container).
+
+**Build-time requirements** (both x86_64 and aarch64, added to the
+Dockerfile alongside the `device: CUDA` CUDA/cuDNN install): TensorRT's
+development headers/libs, `libnvinfer-dev`/`libnvinfer-plugin-dev`/
+`libnvonnxparsers-dev`. On the reference Jetson device, TensorRT 10.3's
+*runtime* was already present (JetPack ships it), these packages just add
+the matching dev headers on top. `tasks/auto_aim/CMakeLists.txt` looks for
+`NvInfer.h`/`libnvinfer`/`libnvonnxparser` plus the CUDA runtime at
+standard system paths; if missing, the project still builds fine, just
+without `device: TENSORRT` support (same graceful-absence pattern as
+`device: CUDA`'s onnxruntime detection).
+
+**Status: implemented, not yet run on real hardware.** Written against
+TensorRT 10.3's C++ API (the version confirmed on the reference Jetson
+device — `enqueueV3`/`setTensorAddress`/tensor-name-based I/O, the current
+API as of TensorRT 8.5+, replacing the older binding-index/`enqueueV2` API)
+but not yet built or executed there. The next thing to verify: does
+`sudo docker build` succeed with the new TensorRT dev packages, does the
+engine actually build from `assets/yolov5.onnx` on device, and — the
+interesting number — how much faster is `configs/demo_tensorrt.yaml`
+(a copy of `demo.yaml` with `device: TENSORRT`) than `demo_cuda.yaml`'s
+40-55ms/frame.
 
 ## 6. Known gaps / things to verify on real hardware
 
-- `device: CUDA` on Jetson (§5.6) is still being iterated against real
-  hardware — status/next-fix noted at the end of §5.6.
-- `device: CUDA` (both §5.5 and §5.6) only has a working ONNX export for
-  `yolov5` — the model every shipped config actually uses. `yolo11`/`yolov8`
-  don't have a CUDA path.
+- `device: TENSORRT` (§5.7) is implemented but not yet run on real
+  hardware — see the status note at the end of §5.7.
+- `device: CUDA` (§5.5/§5.6) and `device: TENSORRT` (§5.7) only have a
+  working ONNX export for `yolov5` — the model every shipped config
+  actually uses. `yolo11`/`yolov8` don't have a CUDA or TensorRT path.
 - Camera SDKs (HikRobot/MindVision) are vendored as prebuilt `.so` files with no
   visible build/version metadata in this repo — if the physical camera's
   firmware requires a newer SDK than what's bundled, you'll need to source an
