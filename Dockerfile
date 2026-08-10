@@ -60,6 +60,16 @@
 # (Docker Desktop mirrors both vendors' driver shims there); on native Linux
 # x86_64 use `--gpus all` (needs the NVIDIA Container Toolkit); on Jetson use
 # `--runtime nvidia -e NVIDIA_VISIBLE_DEVICES=all` (see JETSON_ORIN.md §5.6).
+#
+# `device: TENSORRT` is a third GPU backend, NVIDIA only, using TensorRT's
+# own C++ API directly instead of going through ONNX Runtime at all --
+# expected to be substantially faster than `device: CUDA` for the same
+# model (FP16 + kernel-level autotuning for the exact GPU), though not yet
+# benchmarked on real hardware -- see JETSON_ORIN.md §5.7 for status. Costs
+# a one-time engine build per device (minutes) the first time a config
+# using it runs. `libnvinfer-dev`/`libnvonnxparsers-dev` (TensorRT's
+# build-time headers/libs) are installed alongside the CUDA runtime above,
+# from the same repo (desktop vs Jetson/L4T) and same architecture gating.
 
 FROM ubuntu:22.04
 
@@ -142,7 +152,8 @@ RUN set -eux; \
         apt-get update; \
         apt-get install -y --no-install-recommends \
             cuda-cudart-12-6 cuda-nvrtc-12-6 libcublas-12-6 libcufft-12-6 \
-            libcurand-12-6 libcusparse-12-6 libcusolver-12-6 libcudnn9-cuda-12; \
+            libcurand-12-6 libcusparse-12-6 libcusolver-12-6 libcudnn9-cuda-12 \
+            libnvinfer-dev libnvinfer-plugin-dev libnvonnxparsers-dev; \
         rm -rf /var/lib/apt/lists/*; \
         url="https://github.com/microsoft/onnxruntime/releases/download/v${ONNXRUNTIME_VERSION}/onnxruntime-linux-x64-gpu-${ONNXRUNTIME_VERSION}.tgz"; \
         wget -q "$url" -O /tmp/onnxruntime.tgz; \
@@ -173,16 +184,16 @@ RUN set -eux; \
 # hardware -- CUDA 12.x split libnvJitLink out as its own package, a
 # transitive runtime dependency of cuBLAS/cuSOLVER that isn't obvious from
 # the shared library names alone, and apt's own dependency resolution
-# catches this sort of thing where a manually-curated list won't. (The clue:
-# a separate `nvidia/cuda:12.9.0-devel-*` based container -- full toolkit,
-# apt-resolved, not hand-picked -- is confirmed to run GPU workloads fine on
-# the same reference device. `cuda-libraries-12-6` here is the Jetson repo's
-# runtime-only equivalent of that full toolkit's libraries, chosen to avoid
-# pulling in a compiler toolchain we don't need -- not itself verified
-# working yet, that's the next thing to confirm.) If you're on a different
-# JetPack/L4T version than R36.4.7, check
-# `apt-cache policy cuda-libraries-12-6` on the device first -- the L4T apt
-# suite (`r36.4` below) must match `cat /etc/nv_tegra_release`.
+# catches this sort of thing where a manually-curated list won't.
+# `cuda-libraries-12-6` (confirmed working on real Jetson hardware) is the
+# Jetson repo's runtime-only equivalent of the full toolkit's libraries.
+# libnvinfer-dev/libnvonnxparsers-dev (TensorRT's headers, for `device:
+# TENSORRT`) are included here too -- TensorRT 10.3 was already natively
+# installed on the reference device, these packages just add the matching
+# development headers on top of it. If you're on a different JetPack/L4T
+# version than R36.4.7, check `apt-cache policy cuda-libraries-12-6` on the
+# device first -- the L4T apt suite (`r36.4` below) must match
+# `cat /etc/nv_tegra_release`.
 RUN set -eux; \
     if [ "$(uname -m)" = "aarch64" ]; then \
         wget -qO /etc/apt/trusted.gpg.d/jetson-ota-public.asc https://repo.download.nvidia.com/jetson/jetson-ota-public.asc; \
@@ -190,7 +201,9 @@ RUN set -eux; \
         echo 'deb https://repo.download.nvidia.com/jetson/common r36.4 main' > /etc/apt/sources.list.d/nvidia-l4t-apt-source.list; \
         echo 'deb https://repo.download.nvidia.com/jetson/t234 r36.4 main' >> /etc/apt/sources.list.d/nvidia-l4t-apt-source.list; \
         apt-get update; \
-        apt-get install -y --no-install-recommends cuda-libraries-12-6 libcudnn9-cuda-12; \
+        apt-get install -y --no-install-recommends \
+            cuda-libraries-12-6 libcudnn9-cuda-12 \
+            libnvinfer-dev libnvinfer-plugin-dev libnvonnxparsers-dev; \
         rm -rf /var/lib/apt/lists/*; \
     fi
 

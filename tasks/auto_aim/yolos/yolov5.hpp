@@ -13,6 +13,13 @@
 #include <memory>
 #endif
 
+#ifdef HAVE_TENSORRT
+#include <NvInfer.h>
+#include <cuda_runtime_api.h>
+
+#include <memory>
+#endif
+
 #include "tasks/auto_aim/armor.hpp"
 #include "tasks/auto_aim/detector.hpp"
 #include "tasks/auto_aim/yolo.hpp"
@@ -23,6 +30,7 @@ class YOLOV5 : public YOLOBase
 {
 public:
   YOLOV5(const std::string & config_path, bool debug);
+  ~YOLOV5();
 
   std::list<Armor> detect(const cv::Mat & bgr_img, int frame_count) override;
 
@@ -49,6 +57,27 @@ private:
   std::string ort_input_name_, ort_output_name_;
   cv::Mat infer_cuda(const cv::Mat & input);
 #endif
+
+  bool use_tensorrt_ = false;
+#ifdef HAVE_TENSORRT
+  class TRTLogger : public nvinfer1::ILogger
+  {
+  public:
+    void log(Severity severity, const char * msg) noexcept override;
+  };
+  TRTLogger trt_logger_;
+  std::unique_ptr<nvinfer1::IRuntime> trt_runtime_;
+  std::unique_ptr<nvinfer1::ICudaEngine> trt_engine_;
+  std::unique_ptr<nvinfer1::IExecutionContext> trt_context_;
+  cudaStream_t trt_stream_ = nullptr;
+  void * trt_input_device_ = nullptr;
+  void * trt_output_device_ = nullptr;
+  std::string trt_input_name_, trt_output_name_;
+
+  void trt_build_or_load_engine(const std::string & onnx_path, const std::string & engine_path);
+  cv::Mat infer_tensorrt(const cv::Mat & input);
+#endif
+
   cv::Mat infer_openvino(const cv::Mat & input);
 
   cv::Rect roi_;
