@@ -359,8 +359,17 @@ std::list<Armor> YOLOV5::parse(
   std::vector<cv::Rect> boxes;
   std::vector<std::vector<cv::Point2f>> armors_key_points;
   const float fscale = static_cast<float>(scale);
+  // sigmoid is monotonic, so sigmoid(x) < score_threshold_ iff
+  // x < logit(score_threshold_) -- comparing against this raw-logit
+  // threshold first lets the (by far common) rejected rows skip the actual
+  // sigmoid/exp() call entirely. All 25200 rows were calling exp() every
+  // frame before this; only the handful that clear the threshold need it
+  // now (still computed via sigmoid() below, for the real confidence value
+  // NMS/downstream code needs).
+  const float raw_score_threshold = std::log(score_threshold_ / (1.0f - score_threshold_));
   for (int r = 0; r < output.rows; r++) {
     const float * row = output.ptr<float>(r);
+    if (row[8] < raw_score_threshold) continue;
     double score = sigmoid(row[8]);
 
     if (score < score_threshold_) continue;
