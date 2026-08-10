@@ -516,14 +516,9 @@ void YOLOV5::infer_tensorrt_vic_preprocess(const cv::Mat & bgr_img, int w, int h
   cv::cvtColor(bgr_img, rgba_full_, cv::COLOR_BGR2RGBA);
   auto t1 = std::chrono::steady_clock::now();
 
-  // VIC's Rescale only supports VPI_BORDER_CLAMP (VPI_BORDER_ZERO ->
-  // VPI_ERROR_INVALID_ARGUMENT on real hardware); harmless here since the
-  // rescale is fully in-bounds -- this only affects how source reads past
-  // the image edge are handled during interpolation, not the black padding
-  // (that's still the canvas's own pre-zeroed content outside the view).
   vpi_check(
     vpiSubmitRescale(
-      vpi_stream_, VPI_BACKEND_VIC, vpi_input_, vpi_canvas_view_, VPI_INTERP_LINEAR, VPI_BORDER_CLAMP, 0),
+      vpi_stream_, VPI_BACKEND_VIC, vpi_input_, vpi_canvas_view_, VPI_INTERP_LINEAR, VPI_BORDER_ZERO, 0),
     "vpiSubmitRescale");
   vpi_check(vpiStreamSync(vpi_stream_), "vpiStreamSync");
   auto t2 = std::chrono::steady_clock::now();
