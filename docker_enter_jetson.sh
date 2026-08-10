@@ -26,9 +26,16 @@
 # image, silently diverging from the host repo -- easy to not notice.
 #
 # QT_X11_NO_MITSHM=1 disables the X MIT-SHM (shared memory) extension for
-# GTK/highgui windows -- without it, cv::imshow crashed a few seconds in
-# with a BadAccess/MIT-SHM X error on this setup (container + this X server
-# combination doesn't get along with X11 shared memory for some reason).
+# Qt's own windows, but NOT GTK's (OpenCV highgui here uses the GTK backend,
+# per the "Failed to load module canberra-gtk-module" log line) -- GTK can
+# still crash with "BadShmSeg (invalid shared segment parameter)" without
+# --ipc=host. Root cause: containers get their own IPC namespace by default,
+# so SysV/POSIX shared-memory segments a process creates *inside* the
+# container for MIT-SHM XImages aren't visible to the X server running on
+# the host, outside that namespace -- the segment ID the client references
+# simply doesn't exist from the server's point of view. --ipc=host shares
+# the host's IPC namespace instead, fixing this at the root (matches how
+# NVIDIA's own reference ROS container commands set up X11 too).
 
 set -e
 
@@ -58,6 +65,7 @@ else
   echo "Creating container '${CONTAINER_NAME}'..."
   sudo docker run -d --name "${CONTAINER_NAME}" \
     --runtime nvidia \
+    --ipc=host \
     -e NVIDIA_VISIBLE_DEVICES=all \
     -e NVIDIA_DRIVER_CAPABILITIES=all \
     -e DISPLAY="${DISPLAY}" \
