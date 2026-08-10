@@ -16,6 +16,14 @@
 # The container is created once and reused (not --rm) so that the compiled
 # build/ directory and cached TensorRT engine (assets/yolov5.engine) persist
 # across sessions instead of rebuilding from scratch every time.
+#
+# The ENTIRE repo is bind-mounted (not just configs/logs/assets) so the
+# container always sees whatever's actually on the host's disk right now --
+# git pull, branch switches, local edits, all show up immediately with no
+# rebuild or manual file-copying needed. Same pattern the Windows/x86_64
+# devcontainer.json already uses. Without this, only the source tree that
+# existed at whatever moment `docker build` last ran stays baked into the
+# image, silently diverging from the host repo -- easy to not notice.
 
 set -e
 
@@ -51,9 +59,7 @@ else
     -e XAUTHORITY=/root/.Xauthority \
     -v "${HOME}/.Xauthority:/root/.Xauthority:ro" \
     -v /tmp/.X11-unix:/tmp/.X11-unix:rw \
-    -v "${REPO_DIR}/configs:/root/sp_vision_25/configs" \
-    -v "${REPO_DIR}/logs:/root/sp_vision_25/logs" \
-    -v "${REPO_DIR}/assets:/root/sp_vision_25/assets" \
+    -v "${REPO_DIR}:/root/sp_vision_25" \
     -v /usr/local/cuda-12.6:/usr/local/cuda-12.6:ro \
     "${IMAGE_NAME}" \
     sleep infinity
