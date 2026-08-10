@@ -20,13 +20,18 @@ find_library(ONNXRUNTIME_LIB onnxruntime PATHS /opt/onnxruntime/lib)
 # the cost of needing a one-time engine build per device (see yolov5.cpp
 # and JETSON_ORIN.md). Silently absent if TensorRT's dev headers/libs
 # (libnvinfer-dev, libnvonnxparsers-dev) and the CUDA runtime aren't
-# installed. TensorRT's own headers/libs are all under standard system
-# paths on Ubuntu (installed via apt, unlike OpenVINO/onnxruntime's
-# hand-placed /opt paths), so plain find_path/find_library without an
-# explicit PATHS hint is enough.
-find_path(TENSORRT_INCLUDE_DIR NvInfer.h)
-find_library(TENSORRT_NVINFER_LIB nvinfer)
-find_library(TENSORRT_NVONNXPARSER_LIB nvonnxparser)
+# installed. Explicit multiarch PATHS are needed here: apt installs these
+# under Debian/Ubuntu's per-architecture-triplet layout
+# (/usr/include/aarch64-linux-gnu, /usr/lib/aarch64-linux-gnu on Jetson;
+# .../x86_64-linux-gnu on desktop) -- confirmed via `dpkg -L libnvinfer-dev`
+# on a real Jetson device that plain find_path/find_library without a PATHS
+# hint does not reliably search those on its own.
+find_path(TENSORRT_INCLUDE_DIR NvInfer.h
+    PATHS /usr/include/aarch64-linux-gnu /usr/include/x86_64-linux-gnu /usr/include)
+find_library(TENSORRT_NVINFER_LIB nvinfer
+    PATHS /usr/lib/aarch64-linux-gnu /usr/lib/x86_64-linux-gnu /usr/lib)
+find_library(TENSORRT_NVONNXPARSER_LIB nvonnxparser
+    PATHS /usr/lib/aarch64-linux-gnu /usr/lib/x86_64-linux-gnu /usr/lib)
 find_path(CUDA_INCLUDE_DIR cuda_runtime_api.h PATHS /usr/local/cuda/include)
 find_library(CUDA_CUDART_LIB cudart PATHS /usr/local/cuda/lib64 /usr/local/cuda/targets/aarch64-linux/lib /usr/local/cuda/targets/x86_64-linux/lib)
 
