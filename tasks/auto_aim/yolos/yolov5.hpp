@@ -72,6 +72,13 @@ private:
   cudaStream_t trt_stream_ = nullptr;
   void * trt_input_device_ = nullptr;
   void * trt_output_device_ = nullptr;
+  // Pinned (page-locked) host buffers, allocated once and reused every
+  // frame -- pageable host memory (e.g. plain cv::Mat/new[]) forces the CUDA
+  // driver to stage through an internal pinned bounce buffer on every
+  // cudaMemcpyAsync, roughly doubling H2D/D2H transfer time. Preprocessing
+  // writes directly into trt_input_host_ (no separate host buffer + copy).
+  float * trt_input_host_ = nullptr;
+  float * trt_output_host_ = nullptr;
   std::string trt_input_name_, trt_output_name_;
 
   void trt_build_or_load_engine(const std::string & onnx_path, const std::string & engine_path);

@@ -97,6 +97,15 @@ YOLOV5::YOLOV5(const std::string & config_path, bool debug)
     if (cudaMalloc(&trt_output_device_, 1 * 25200 * 22 * sizeof(float)) != cudaSuccess)
       throw std::runtime_error("YOLOV5: cudaMalloc (output) failed");
 
+    // Pinned host buffers, allocated once here rather than per-frame (see
+    // the member comment in yolov5.hpp).
+    if (cudaMallocHost(reinterpret_cast<void **>(&trt_input_host_), 1 * 3 * 640 * 640 * sizeof(float)) !=
+        cudaSuccess)
+      throw std::runtime_error("YOLOV5: cudaMallocHost (input) failed");
+    if (cudaMallocHost(reinterpret_cast<void **>(&trt_output_host_), 1 * 25200 * 22 * sizeof(float)) !=
+        cudaSuccess)
+      throw std::runtime_error("YOLOV5: cudaMallocHost (output) failed");
+
     for (int i = 0; i < trt_engine_->getNbIOTensors(); i++) {
       std::string name = trt_engine_->getIOTensorName(i);
       if (trt_engine_->getTensorIOMode(name.c_str()) == nvinfer1::TensorIOMode::kINPUT) {
@@ -147,6 +156,8 @@ YOLOV5::~YOLOV5()
 #ifdef HAVE_TENSORRT
   if (trt_input_device_) cudaFree(trt_input_device_);
   if (trt_output_device_) cudaFree(trt_output_device_);
+  if (trt_input_host_) cudaFreeHost(trt_input_host_);
+  if (trt_output_host_) cudaFreeHost(trt_output_host_);
   if (trt_stream_) cudaStreamDestroy(trt_stream_);
 #endif
 }
@@ -337,29 +348,34 @@ void YOLOV5::trt_build_or_load_engine(const std::string & onnx_path, const std::
 
 cv::Mat YOLOV5::infer_tensorrt(const cv::Mat & input)
 {
-  cv::Mat rgb, chw_input(3, 640 * 640, CV_32F);
+  cv::Mat rgb;
   cv::cvtColor(input, rgb, cv::COLOR_BGR2RGB);
   rgb.convertTo(rgb, CV_32F, 1.0 / 255.0);
 
+  // chw_input views trt_input_host_ directly (the persistent pinned buffer
+  // allocated in the constructor) -- cv::split() below writes straight into
+  // pinned memory, no separate host allocation/copy per frame.
+  cv::Mat chw_input(3, 640 * 640, CV_32F, trt_input_host_);
   std::vector<cv::Mat> channels(3);
   for (int c = 0; c < 3; c++) channels[c] = cv::Mat(640, 640, CV_32F, chw_input.ptr(c));
   cv::split(rgb, channels);
 
   cudaMemcpyAsync(
-    trt_input_device_, chw_input.data, chw_input.total() * sizeof(float), cudaMemcpyHostToDevice,
+    trt_input_device_, trt_input_host_, 1 * 3 * 640 * 640 * sizeof(float), cudaMemcpyHostToDevice,
     trt_stream_);
 
   if (!trt_context_->enqueueV3(trt_stream_)) {
     throw std::runtime_error("YOLOV5: TensorRT enqueueV3 failed");
   }
 
-  cv::Mat output(25200, 22, CV_32F);
   cudaMemcpyAsync(
-    output.data, trt_output_device_, output.total() * sizeof(float), cudaMemcpyDeviceToHost,
+    trt_output_host_, trt_output_device_, 1 * 25200 * 22 * sizeof(float), cudaMemcpyDeviceToHost,
     trt_stream_);
   cudaStreamSynchronize(trt_stream_);
 
-  return output;
+  // clone(): trt_output_host_ is a persistent buffer reused every call, so
+  // the caller needs its own copy, not a view into it.
+  return cv::Mat(25200, 22, CV_32F, trt_output_host_).clone();
 }
 #endif
 
