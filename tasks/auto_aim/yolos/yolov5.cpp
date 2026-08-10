@@ -4,6 +4,7 @@
 #include <yaml-cpp/yaml.h>
 
 #include <array>
+#include <chrono>
 #include <filesystem>
 #include <fstream>
 
@@ -208,7 +209,13 @@ std::list<Armor> YOLOV5::detect(const cv::Mat & raw_img, int frame_count)
     output = infer_openvino(input);
   }
 
-  return parse(scale, output, raw_img, frame_count);
+  auto t_infer_done = std::chrono::steady_clock::now();
+  auto result = parse(scale, output, raw_img, frame_count);
+  auto t_parse_done = std::chrono::steady_clock::now();
+  tools::logger()->info(
+    "[PARSE-TIMING] parse={:.2f}ms",
+    std::chrono::duration<double, std::milli>(t_parse_done - t_infer_done).count());
+  return result;
 }
 
 cv::Mat YOLOV5::infer_openvino(const cv::Mat & input)
@@ -383,37 +390,51 @@ std::list<Armor> YOLOV5::parse(
   double scale, cv::Mat & output, const cv::Mat & bgr_img, int frame_count)
 {
   // for each row: xywh + classess
+  //
+  // Rewritten to scan `output` via raw float pointers instead of
+  // cv::Mat::at()/row().colRange()/cv::minMaxLoc(): those are all fine for
+  // occasional use, but this loop runs across all 25200 candidate rows every
+  // frame, and their per-call overhead (bounds checks, temporary cv::Mat
+  // header construction, OpenCV API call overhead) adds up at that scale --
+  // measured as a bigger share of total per-frame time than the actual GPU
+  // inference itself on Jetson. Semantics are unchanged: same sigmoid
+  // threshold, same argmax-over-range logic cv::minMaxLoc was doing (just
+  // inlined as a manual scan over 4 / 9 elements), same keypoint/rect math.
   std::vector<int> color_ids, num_ids;
   std::vector<float> confidences;
   std::vector<cv::Rect> boxes;
   std::vector<std::vector<cv::Point2f>> armors_key_points;
+  const float fscale = static_cast<float>(scale);
   for (int r = 0; r < output.rows; r++) {
-    double score = output.at<float>(r, 8);
-    score = sigmoid(score);
+    const float * row = output.ptr<float>(r);
+    double score = sigmoid(row[8]);
 
     if (score < score_threshold_) continue;
 
-    std::vector<cv::Point2f> armor_key_points;
+    //颜色和类别独热向量 (argmax over cols 9-12 and 13-21 respectively)
+    int _color_id = 0;
+    float best_color = row[9];
+    for (int i = 1; i < 4; i++) {
+      if (row[9 + i] > best_color) {
+        best_color = row[9 + i];
+        _color_id = i;
+      }
+    }
+    int _class_id = 0;
+    float best_class = row[13];
+    for (int i = 1; i < 9; i++) {
+      if (row[13 + i] > best_class) {
+        best_class = row[13 + i];
+        _class_id = i;
+      }
+    }
 
-    //颜色和类别独热向量
-    cv::Mat color_scores = output.row(r).colRange(9, 13);     //color
-    cv::Mat classes_scores = output.row(r).colRange(13, 22);  //num
-    cv::Point class_id, color_id;
-    int _class_id, _color_id;
-    double score_color, score_num;
-    cv::minMaxLoc(classes_scores, NULL, &score_num, NULL, &class_id);
-    cv::minMaxLoc(color_scores, NULL, &score_color, NULL, &color_id);
-    _class_id = class_id.x;
-    _color_id = color_id.x;
-
-    armor_key_points.push_back(
-      cv::Point2f(output.at<float>(r, 0) / scale, output.at<float>(r, 1) / scale));
-    armor_key_points.push_back(
-      cv::Point2f(output.at<float>(r, 6) / scale, output.at<float>(r, 7) / scale));
-    armor_key_points.push_back(
-      cv::Point2f(output.at<float>(r, 4) / scale, output.at<float>(r, 5) / scale));
-    armor_key_points.push_back(
-      cv::Point2f(output.at<float>(r, 2) / scale, output.at<float>(r, 3) / scale));
+    std::vector<cv::Point2f> armor_key_points{
+      {row[0] / fscale, row[1] / fscale},
+      {row[6] / fscale, row[7] / fscale},
+      {row[4] / fscale, row[5] / fscale},
+      {row[2] / fscale, row[3] / fscale},
+    };
 
     float min_x = armor_key_points[0].x;
     float max_x = armor_key_points[0].x;
@@ -432,8 +453,8 @@ std::list<Armor> YOLOV5::parse(
     color_ids.emplace_back(_color_id);
     num_ids.emplace_back(_class_id);
     boxes.emplace_back(rect);
-    confidences.emplace_back(score);
-    armors_key_points.emplace_back(armor_key_points);
+    confidences.emplace_back(static_cast<float>(score));
+    armors_key_points.emplace_back(std::move(armor_key_points));
   }
 
   std::vector<int> indices;
