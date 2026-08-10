@@ -373,17 +373,16 @@ cv::Mat YOLOV5::infer_tensorrt(const cv::Mat & input)
 {
   auto t0 = std::chrono::steady_clock::now();
 
-  cv::Mat rgb;
-  cv::cvtColor(input, rgb, cv::COLOR_BGR2RGB);
-  rgb.convertTo(rgb, CV_32F, 1.0 / 255.0);
-
-  // chw_input views trt_input_host_ directly (the persistent pinned buffer
-  // allocated in the constructor) -- cv::split() below writes straight into
-  // pinned memory, no separate host allocation/copy per frame.
-  cv::Mat chw_input(3, 640 * 640, CV_32F, trt_input_host_);
-  std::vector<cv::Mat> channels(3);
-  for (int c = 0; c < 3; c++) channels[c] = cv::Mat(640, 640, CV_32F, chw_input.ptr(c));
-  cv::split(rgb, channels);
+  // cv::dnn::blobFromImage fuses BGR->RGB swap, u8->f32 scale, and
+  // HWC->CHW channel splitting into one optimized call, replacing a
+  // 3-separate-full-image-pass chain (cvtColor + convertTo + split) that
+  // measured as a meaningful per-frame cost. `blob` wraps trt_input_host_
+  // (the persistent pinned buffer) directly with the exact target shape, so
+  // OpenCV's Mat::create() inside blobFromImage recognizes it already
+  // matches and writes straight into it rather than allocating its own.
+  int blob_shape[4] = {1, 3, 640, 640};
+  cv::Mat blob(4, blob_shape, CV_32F, trt_input_host_);
+  cv::dnn::blobFromImage(input, blob, 1.0 / 255.0, cv::Size(640, 640), cv::Scalar(), true, false, CV_32F);
 
   auto t1 = std::chrono::steady_clock::now();
 
