@@ -8,10 +8,6 @@
 #include <filesystem>
 #include <fstream>
 
-#ifdef HAVE_TENSORRT
-#include <NvOnnxParser.h>
-#endif
-
 #include "tools/img_tools.hpp"
 #include "tools/logger.hpp"
 
@@ -82,7 +78,7 @@ YOLOV5::YOLOV5(const std::string & config_path, bool debug)
     auto onnx_path = (dot == std::string::npos ? model_path_ : model_path_.substr(0, dot)) + ".onnx";
     auto engine_path = (dot == std::string::npos ? model_path_ : model_path_.substr(0, dot)) + ".engine";
 
-    trt_build_or_load_engine(onnx_path, engine_path);
+    trt_build_or_load_engine(trt_logger_, trt_runtime_, trt_engine_, onnx_path, engine_path);
 
     trt_context_.reset(trt_engine_->createExecutionContext());
     if (!trt_context_) throw std::runtime_error("YOLOV5: failed to create TensorRT execution context");
@@ -296,79 +292,6 @@ cv::Mat YOLOV5::infer_cuda(const cv::Mat & input)
 #endif
 
 #ifdef HAVE_TENSORRT
-void YOLOV5::TRTLogger::log(Severity severity, const char * msg) noexcept
-{
-  if (severity <= Severity::kWARNING) {
-    tools::logger()->warn("[TensorRT] {}", msg);
-  }
-}
-
-void YOLOV5::trt_build_or_load_engine(const std::string & onnx_path, const std::string & engine_path)
-{
-  trt_runtime_.reset(nvinfer1::createInferRuntime(trt_logger_));
-  if (!trt_runtime_) throw std::runtime_error("YOLOV5: failed to create TensorRT runtime");
-
-  std::ifstream engine_file(engine_path, std::ios::binary | std::ios::ate);
-  if (engine_file.good()) {
-    auto size = engine_file.tellg();
-    engine_file.seekg(0);
-    std::vector<char> engine_data(static_cast<size_t>(size));
-    engine_file.read(engine_data.data(), size);
-    trt_engine_.reset(trt_runtime_->deserializeCudaEngine(engine_data.data(), engine_data.size()));
-    if (!trt_engine_) {
-      throw std::runtime_error(
-        "YOLOV5: failed to deserialize cached TensorRT engine at " + engine_path +
-        " (likely built for a different GPU/TensorRT/CUDA version -- delete it to force a rebuild)");
-    }
-    tools::logger()->info("YOLOV5: loaded cached TensorRT engine from {}", engine_path);
-    return;
-  }
-
-  // No cached engine: build one from the .onnx model. This is a one-time,
-  // slow (can take several minutes) operation per device -- the resulting
-  // .engine file is tied to the exact GPU/TensorRT/CUDA version it was built
-  // on (not portable across devices, unlike the .onnx/.xml models) and is
-  // cached to disk here so subsequent runs skip straight to the fast load
-  // path above. See JETSON_ORIN.md for how to pre-build this ahead of time
-  // instead of eating the delay on first run.
-  tools::logger()->warn(
-    "YOLOV5: no cached TensorRT engine at {}, building one from {} now "
-    "(one-time, can take several minutes)...",
-    engine_path, onnx_path);
-
-  std::unique_ptr<nvinfer1::IBuilder> builder(nvinfer1::createInferBuilder(trt_logger_));
-  if (!builder) throw std::runtime_error("YOLOV5: failed to create TensorRT builder");
-
-  std::unique_ptr<nvinfer1::INetworkDefinition> network(builder->createNetworkV2(0U));
-  if (!network) throw std::runtime_error("YOLOV5: failed to create TensorRT network");
-
-  std::unique_ptr<nvonnxparser::IParser> parser(nvonnxparser::createParser(*network, trt_logger_));
-  if (!parser) throw std::runtime_error("YOLOV5: failed to create TensorRT ONNX parser");
-
-  if (!parser->parseFromFile(
-        onnx_path.c_str(), static_cast<int>(nvinfer1::ILogger::Severity::kWARNING))) {
-    throw std::runtime_error("YOLOV5: TensorRT failed to parse " + onnx_path);
-  }
-
-  std::unique_ptr<nvinfer1::IBuilderConfig> config(builder->createBuilderConfig());
-  if (!config) throw std::runtime_error("YOLOV5: failed to create TensorRT builder config");
-  config->setMemoryPoolLimit(nvinfer1::MemoryPoolType::kWORKSPACE, 1ULL << 30);
-  bool fp16_supported = builder->platformHasFastFp16();
-  tools::logger()->info("YOLOV5: TensorRT platformHasFastFp16={}", fp16_supported);
-  if (fp16_supported) config->setFlag(nvinfer1::BuilderFlag::kFP16);
-
-  std::unique_ptr<nvinfer1::IHostMemory> serialized(builder->buildSerializedNetwork(*network, *config));
-  if (!serialized) throw std::runtime_error("YOLOV5: TensorRT engine build failed");
-
-  std::ofstream out(engine_path, std::ios::binary);
-  out.write(reinterpret_cast<const char *>(serialized->data()), static_cast<std::streamsize>(serialized->size()));
-  out.close();
-  tools::logger()->info("YOLOV5: built and cached TensorRT engine at {}", engine_path);
-
-  trt_engine_.reset(trt_runtime_->deserializeCudaEngine(serialized->data(), serialized->size()));
-  if (!trt_engine_) throw std::runtime_error("YOLOV5: failed to deserialize freshly-built TensorRT engine");
-}
-
 cv::Mat YOLOV5::infer_tensorrt(const cv::Mat & input)
 {
   auto t0 = std::chrono::steady_clock::now();

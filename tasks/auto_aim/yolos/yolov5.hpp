@@ -18,6 +18,8 @@
 #include <cuda_runtime_api.h>
 
 #include <memory>
+
+#include "tasks/auto_aim/yolos/trt_engine.hpp"
 #endif
 
 #include "tasks/auto_aim/armor.hpp"
@@ -60,11 +62,6 @@ private:
 
   bool use_tensorrt_ = false;
 #ifdef HAVE_TENSORRT
-  class TRTLogger : public nvinfer1::ILogger
-  {
-  public:
-    void log(Severity severity, const char * msg) noexcept override;
-  };
   TRTLogger trt_logger_;
   std::unique_ptr<nvinfer1::IRuntime> trt_runtime_;
   std::unique_ptr<nvinfer1::ICudaEngine> trt_engine_;
@@ -81,7 +78,6 @@ private:
   float * trt_output_host_ = nullptr;
   std::string trt_input_name_, trt_output_name_;
 
-  void trt_build_or_load_engine(const std::string & onnx_path, const std::string & engine_path);
   cv::Mat infer_tensorrt(const cv::Mat & input);
 #endif
 
