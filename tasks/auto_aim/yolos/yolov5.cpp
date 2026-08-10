@@ -303,6 +303,83 @@ void YOLOV5::TRTLogger::log(Severity severity, const char * msg) noexcept
   }
 }
 
+namespace
+{
+// Feeds representative frames from the demo video through the network
+// during INT8 calibration, so TensorRT can compute per-tensor quantization
+// ranges. Preprocessing here mirrors infer_tensorrt()'s exactly (same
+// letterbox + blobFromImage) -- calibration ranges are only meaningful if
+// they reflect real inference-time activations. Experimental: not yet
+// verified this actually keeps detection quality acceptable, hence
+// pairing INT8 with FP16 (see trt_build_or_load_engine) so TensorRT can
+// fall back to FP16 per-layer wherever INT8 would hurt accuracy too much,
+// rather than forcing INT8 everywhere regardless of cost.
+class Int8Calibrator : public nvinfer1::IInt8EntropyCalibrator2
+{
+public:
+  Int8Calibrator(const std::string & video_path, int max_batches)
+  : max_batches_(max_batches), host_buffer_(1 * 3 * 640 * 640)
+  {
+    cap_.open(video_path);
+    if (cudaMalloc(&device_input_, host_buffer_.size() * sizeof(float)) != cudaSuccess) {
+      throw std::runtime_error("Int8Calibrator: cudaMalloc failed");
+    }
+  }
+
+  ~Int8Calibrator() override
+  {
+    if (device_input_) cudaFree(device_input_);
+  }
+
+  int getBatchSize() const noexcept override { return 1; }
+
+  bool getBatch(void * bindings[], const char * names[], int nbBindings) noexcept override
+  {
+    (void)names;
+    (void)nbBindings;
+    if (batch_count_ >= max_batches_ || !cap_.isOpened()) return false;
+
+    cv::Mat frame;
+    if (!cap_.read(frame) || frame.empty()) return false;
+
+    auto x_scale = 640.0 / frame.rows;
+    auto y_scale = 640.0 / frame.cols;
+    auto scale = std::min(x_scale, y_scale);
+    int h = static_cast<int>(frame.rows * scale);
+    int w = static_cast<int>(frame.cols * scale);
+    cv::Mat letterboxed(640, 640, CV_8UC3, cv::Scalar(0, 0, 0));
+    cv::resize(frame, letterboxed(cv::Rect(0, 0, w, h)), {w, h});
+
+    int blob_shape[4] = {1, 3, 640, 640};
+    cv::Mat blob(4, blob_shape, CV_32F, host_buffer_.data());
+    cv::dnn::blobFromImage(
+      letterboxed, blob, 1.0 / 255.0, cv::Size(640, 640), cv::Scalar(), true, false, CV_32F);
+
+    cudaMemcpy(
+      device_input_, host_buffer_.data(), host_buffer_.size() * sizeof(float),
+      cudaMemcpyHostToDevice);
+    bindings[0] = device_input_;
+    batch_count_++;
+    return true;
+  }
+
+  const void * readCalibrationCache(size_t & length) noexcept override
+  {
+    length = 0;
+    return nullptr;
+  }
+
+  void writeCalibrationCache(const void *, size_t) noexcept override {}
+
+private:
+  cv::VideoCapture cap_;
+  void * device_input_ = nullptr;
+  std::vector<float> host_buffer_;
+  int batch_count_ = 0;
+  int max_batches_;
+};
+}  // namespace
+
 void YOLOV5::trt_build_or_load_engine(const std::string & onnx_path, const std::string & engine_path)
 {
   trt_runtime_.reset(nvinfer1::createInferRuntime(trt_logger_));
@@ -356,6 +433,23 @@ void YOLOV5::trt_build_or_load_engine(const std::string & onnx_path, const std::
   bool fp16_supported = builder->platformHasFastFp16();
   tools::logger()->info("YOLOV5: TensorRT platformHasFastFp16={}", fp16_supported);
   if (fp16_supported) config->setFlag(nvinfer1::BuilderFlag::kFP16);
+
+  // Experimental: INT8 (paired with FP16 above as a per-layer fallback, not
+  // used alone -- see Int8Calibrator's comment). Calibrates against
+  // assets/demo/demo.avi, the same video used for testing throughout this
+  // session, since it's already known-representative. If that file doesn't
+  // exist in your deployment, this silently calibrates against nothing
+  // useful -- check the log line below actually reports a sane frame count
+  // if you rely on this.
+  bool int8_supported = builder->platformHasFastInt8();
+  tools::logger()->info("YOLOV5: TensorRT platformHasFastInt8={}", int8_supported);
+  std::unique_ptr<Int8Calibrator> calibrator;
+  if (int8_supported) {
+    config->setFlag(nvinfer1::BuilderFlag::kINT8);
+    calibrator = std::make_unique<Int8Calibrator>("assets/demo/demo.avi", 100);
+    config->setInt8Calibrator(calibrator.get());
+    tools::logger()->info("YOLOV5: TensorRT INT8 enabled, calibrating from assets/demo/demo.avi");
+  }
 
   std::unique_ptr<nvinfer1::IHostMemory> serialized(builder->buildSerializedNetwork(*network, *config));
   if (!serialized) throw std::runtime_error("YOLOV5: TensorRT engine build failed");
