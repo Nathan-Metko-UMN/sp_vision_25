@@ -190,10 +190,21 @@ std::list<Armor> YOLOV5::detect(const cv::Mat & raw_img, int frame_count)
   auto w = static_cast<int>(bgr_img.cols * scale);
 
   // preproces
+  //
+  // letterbox_canvas_ is reused across frames instead of allocating +
+  // zero-filling a fresh buffer every call: for a fixed camera/ROI, w/h
+  // (and therefore the padding region) never change frame to frame, so the
+  // zero-fill only actually needs to happen once. Only re-zeroed if the
+  // computed size changed (first frame, or the source resolution changed).
   auto t_letterbox_start = std::chrono::steady_clock::now();
-  auto input = cv::Mat(640, 640, CV_8UC3, cv::Scalar(0, 0, 0));
+  if (letterbox_canvas_.empty() || letterbox_w_ != w || letterbox_h_ != h) {
+    letterbox_canvas_ = cv::Mat(640, 640, CV_8UC3, cv::Scalar(0, 0, 0));
+    letterbox_w_ = w;
+    letterbox_h_ = h;
+  }
   auto roi = cv::Rect(0, 0, w, h);
-  cv::resize(bgr_img, input(roi), {w, h});
+  cv::resize(bgr_img, letterbox_canvas_(roi), {w, h});
+  auto & input = letterbox_canvas_;
   auto t_letterbox_done = std::chrono::steady_clock::now();
   tools::logger()->info(
     "[LETTERBOX-TIMING] letterbox={:.2f}ms",

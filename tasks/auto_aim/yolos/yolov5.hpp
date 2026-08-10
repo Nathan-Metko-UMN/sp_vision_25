@@ -91,6 +91,14 @@ private:
   cv::Point2f offset_;
   cv::Mat tmp_img_;
 
+  // Persistent letterbox canvas, reused every frame instead of allocating +
+  // zero-filling a fresh 640x640x3 buffer each call (measured as a real,
+  // non-trivial per-frame cost on Jetson). Valid whenever letterbox_w_/
+  // letterbox_h_ match the current frame's computed resize target; re-zeroed
+  // if not (e.g. first frame, or source resolution changed).
+  cv::Mat letterbox_canvas_;
+  int letterbox_w_ = -1, letterbox_h_ = -1;
+
   Detector detector_;
   friend class MultiThreadDetector;
 
