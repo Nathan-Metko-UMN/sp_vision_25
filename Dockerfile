@@ -79,7 +79,23 @@
 # time -- see JETSON_ORIN.md §5.7 for the full explanation and the exact
 # mount flag.
 
-FROM ubuntu:22.04
+# BASE_IMAGE defaults to plain ubuntu:22.04 (works for both x86_64 dev
+# machines and aarch64) so nothing changes for non-Jetson builds. On Jetson,
+# override it to NVIDIA's official l4t-jetpack image (aarch64-only, so never
+# the default) -- required for NVIDIA VPI's VIC (hardware image processor)
+# backend to work inside a container. A plain ubuntu:22.04 base + apt-installed
+# nvidia-vpi crashes VIC with a silent SIGABRT during `import vpi`/first use,
+# for reasons that didn't trace back to any specific missing package (tried:
+# extra privileges/host namespaces, nvidia-vpi + libegl1/libgles2, forcing
+# glvnd to only the NVIDIA EGL vendor ICD, libdrm-tegra0 -- none fixed it).
+# l4t-jetpack works out of the box with zero extra flags/packages, so we use
+# it as the base instead of continuing to bisect blindly against a
+# closed-source driver stack. Build on Jetson with, e.g.:
+#   docker build --build-arg BASE_IMAGE=nvcr.io/nvidia/l4t-jetpack:r36.4.0 -t sp_vision_25 .
+# (pick the l4t-jetpack tag matching the device's L4T release --
+# `cat /etc/nv_tegra_release` -- same rule as the r36.4 apt suite below.)
+ARG BASE_IMAGE=ubuntu:22.04
+FROM ${BASE_IMAGE}
 
 ARG OPENVINO_VERSION=2024.6.0
 ARG OPENVINO_SERIES=2024.6
@@ -211,7 +227,8 @@ RUN set -eux; \
         apt-get update; \
         apt-get install -y --no-install-recommends \
             cuda-libraries-12-6 libcudnn9-cuda-12 \
-            libnvinfer-dev libnvinfer-plugin-dev libnvonnxparsers-dev; \
+            libnvinfer-dev libnvinfer-plugin-dev libnvonnxparsers-dev \
+            vpi3-dev; \
         rm -rf /var/lib/apt/lists/*; \
     fi
 
