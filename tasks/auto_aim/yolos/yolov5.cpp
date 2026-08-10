@@ -155,6 +155,8 @@ YOLOV5::~YOLOV5()
   if (trt_output_device_) cudaFree(trt_output_device_);
   if (trt_input_host_) cudaFreeHost(trt_input_host_);
   if (trt_output_host_) cudaFreeHost(trt_output_host_);
+  if (trt_raw_input_device_) cudaFree(trt_raw_input_device_);
+  if (trt_raw_input_host_) cudaFreeHost(trt_raw_input_host_);
   if (trt_stream_) cudaStreamDestroy(trt_stream_);
 #endif
 }
@@ -185,40 +187,46 @@ std::list<Armor> YOLOV5::detect(const cv::Mat & raw_img, int frame_count)
   auto h = static_cast<int>(bgr_img.rows * scale);
   auto w = static_cast<int>(bgr_img.cols * scale);
 
-  // preproces
-  //
-  // letterbox_canvas_ is reused across frames instead of allocating +
-  // zero-filling a fresh buffer every call: for a fixed camera/ROI, w/h
-  // (and therefore the padding region) never change frame to frame, so the
-  // zero-fill only actually needs to happen once. Only re-zeroed if the
-  // computed size changed (first frame, or the source resolution changed).
-  auto t_letterbox_start = std::chrono::steady_clock::now();
-  if (letterbox_canvas_.empty() || letterbox_w_ != w || letterbox_h_ != h) {
-    letterbox_canvas_ = cv::Mat(640, 640, CV_8UC3, cv::Scalar(0, 0, 0));
-    letterbox_w_ = w;
-    letterbox_h_ = h;
-  }
-  auto roi = cv::Rect(0, 0, w, h);
-  cv::resize(bgr_img, letterbox_canvas_(roi), {w, h});
-  auto & input = letterbox_canvas_;
-  auto t_letterbox_done = std::chrono::steady_clock::now();
-  tools::logger()->info(
-    "[LETTERBOX-TIMING] letterbox={:.2f}ms",
-    std::chrono::duration<double, std::milli>(t_letterbox_done - t_letterbox_start).count());
-
   cv::Mat output;
 #ifdef HAVE_TENSORRT
   if (use_tensorrt_) {
-    output = infer_tensorrt(input);
-  } else
-#endif
-#ifdef HAVE_ONNXRUNTIME
-  if (use_cuda_) {
-    output = infer_cuda(input);
+    // GPU-resident preprocessing (see infer_tensorrt_gpu_preprocess): the
+    // CPU letterbox resize + blobFromImage chain below is skipped entirely
+    // for this backend -- bgr_img (unresized, original resolution) is
+    // handed straight to the GPU.
+    output = infer_tensorrt_gpu_preprocess(bgr_img, w, h, scale);
   } else
 #endif
   {
-    output = infer_openvino(input);
+    // preproces
+    //
+    // letterbox_canvas_ is reused across frames instead of allocating +
+    // zero-filling a fresh buffer every call: for a fixed camera/ROI, w/h
+    // (and therefore the padding region) never change frame to frame, so the
+    // zero-fill only actually needs to happen once. Only re-zeroed if the
+    // computed size changed (first frame, or the source resolution changed).
+    auto t_letterbox_start = std::chrono::steady_clock::now();
+    if (letterbox_canvas_.empty() || letterbox_w_ != w || letterbox_h_ != h) {
+      letterbox_canvas_ = cv::Mat(640, 640, CV_8UC3, cv::Scalar(0, 0, 0));
+      letterbox_w_ = w;
+      letterbox_h_ = h;
+    }
+    auto roi = cv::Rect(0, 0, w, h);
+    cv::resize(bgr_img, letterbox_canvas_(roi), {w, h});
+    auto & input = letterbox_canvas_;
+    auto t_letterbox_done = std::chrono::steady_clock::now();
+    tools::logger()->info(
+      "[LETTERBOX-TIMING] letterbox={:.2f}ms",
+      std::chrono::duration<double, std::milli>(t_letterbox_done - t_letterbox_start).count());
+
+#ifdef HAVE_ONNXRUNTIME
+    if (use_cuda_) {
+      output = infer_cuda(input);
+    } else
+#endif
+    {
+      output = infer_openvino(input);
+    }
   }
 
   auto t_infer_done = std::chrono::steady_clock::now();
@@ -292,47 +300,71 @@ cv::Mat YOLOV5::infer_cuda(const cv::Mat & input)
 #endif
 
 #ifdef HAVE_TENSORRT
-cv::Mat YOLOV5::infer_tensorrt(const cv::Mat & input)
+// GPU-resident preprocessing: skips the CPU letterbox + blobFromImage
+// entirely. bgr_img is the raw, unresized source frame (or ROI crop) --
+// copied into a pinned staging buffer, H2D'd to the device as-is, then
+// letterbox-resized + BGR->RGB + normalized + transposed to CHW by a single
+// CUDA kernel (see preprocess_kernel.cu) writing directly into
+// trt_input_device_. No host sync between the H2D copy, the kernel launch,
+// and enqueueV3 -- all three are enqueued on the same trt_stream_, and CUDA
+// streams execute in FIFO order, so each is guaranteed to see the previous
+// one's writes without an explicit intermediate cudaStreamSynchronize.
+cv::Mat YOLOV5::infer_tensorrt_gpu_preprocess(const cv::Mat & bgr_img, int w, int h, double scale)
 {
   auto t0 = std::chrono::steady_clock::now();
 
-  // cv::dnn::blobFromImage fuses BGR->RGB swap, u8->f32 scale, and
-  // HWC->CHW channel splitting into one optimized call, replacing a
-  // 3-separate-full-image-pass chain (cvtColor + convertTo + split) that
-  // measured as a meaningful per-frame cost. `blob` wraps trt_input_host_
-  // (the persistent pinned buffer) directly with the exact target shape, so
-  // OpenCV's Mat::create() inside blobFromImage recognizes it already
-  // matches and writes straight into it rather than allocating its own.
-  int blob_shape[4] = {1, 3, 640, 640};
-  cv::Mat blob(4, blob_shape, CV_32F, trt_input_host_);
-  cv::dnn::blobFromImage(input, blob, 1.0 / 255.0, cv::Size(640, 640), cv::Scalar(), true, false, CV_32F);
+  // Lazily (re)allocate the raw-frame staging buffers -- only changes if
+  // the source resolution changes (never, in practice, for a fixed
+  // camera/ROI), mirroring letterbox_canvas_'s lazy-realloc pattern.
+  if (trt_raw_w_ != bgr_img.cols || trt_raw_h_ != bgr_img.rows) {
+    if (trt_raw_input_device_) cudaFree(trt_raw_input_device_);
+    if (trt_raw_input_host_) cudaFreeHost(trt_raw_input_host_);
+    size_t raw_size = static_cast<size_t>(bgr_img.cols) * bgr_img.rows * 3;
+    if (cudaMalloc(&trt_raw_input_device_, raw_size) != cudaSuccess)
+      throw std::runtime_error("YOLOV5: cudaMalloc (raw input) failed");
+    if (cudaMallocHost(reinterpret_cast<void **>(&trt_raw_input_host_), raw_size) != cudaSuccess)
+      throw std::runtime_error("YOLOV5: cudaMallocHost (raw input) failed");
+    trt_raw_w_ = bgr_img.cols;
+    trt_raw_h_ = bgr_img.rows;
+  }
 
+  // Copy into the tightly-packed pinned staging buffer. copyTo (not a flat
+  // memcpy) handles both a plain contiguous frame (one fast memcpy) and a
+  // non-contiguous ROI-cropped view (use_roi_: true; per-row memcpy
+  // respecting bgr_img's own stride) correctly either way.
+  cv::Mat host_view(bgr_img.rows, bgr_img.cols, CV_8UC3, trt_raw_input_host_);
+  bgr_img.copyTo(host_view);
   auto t1 = std::chrono::steady_clock::now();
 
+  size_t raw_size = static_cast<size_t>(bgr_img.cols) * bgr_img.rows * 3;
   cudaMemcpyAsync(
-    trt_input_device_, trt_input_host_, 1 * 3 * 640 * 640 * sizeof(float), cudaMemcpyHostToDevice,
-    trt_stream_);
-  cudaStreamSynchronize(trt_stream_);
+    trt_raw_input_device_, trt_raw_input_host_, raw_size, cudaMemcpyHostToDevice, trt_stream_);
 
+  launch_letterbox_preprocess(
+    static_cast<const uint8_t *>(trt_raw_input_device_), bgr_img.cols, bgr_img.rows, bgr_img.cols * 3,
+    trt_input_device_, w, h, static_cast<float>(scale), trt_stream_);
   auto t2 = std::chrono::steady_clock::now();
 
   if (!trt_context_->enqueueV3(trt_stream_)) {
     throw std::runtime_error("YOLOV5: TensorRT enqueueV3 failed");
   }
   cudaStreamSynchronize(trt_stream_);
-
   auto t3 = std::chrono::steady_clock::now();
 
   cudaMemcpyAsync(
     trt_output_host_, trt_output_device_, 1 * 25200 * 22 * sizeof(float), cudaMemcpyDeviceToHost,
     trt_stream_);
   cudaStreamSynchronize(trt_stream_);
-
   auto t4 = std::chrono::steady_clock::now();
+
   auto ms = [](auto a, auto b) { return std::chrono::duration<double, std::milli>(b - a).count(); };
   tools::logger()->info(
-    "[TRT-TIMING] preprocess={:.2f}ms h2d={:.2f}ms infer={:.2f}ms d2h={:.2f}ms",
-    ms(t0, t1), ms(t1, t2), ms(t2, t3), ms(t3, t4));
+    // "gpu_wait" = time waiting for the preprocessing kernel + TensorRT
+    // inference to actually finish executing on the GPU (both dispatched
+    // async at t2, so this bucket isn't purely "infer" anymore -- the sync
+    // at t3 can't distinguish where GPU time went between the two).
+    "[TRT-TIMING] memcpy={:.2f}ms dispatch={:.2f}ms gpu_wait={:.2f}ms d2h={:.2f}ms", ms(t0, t1),
+    ms(t1, t2), ms(t2, t3), ms(t3, t4));
 
   // clone(): trt_output_host_ is a persistent buffer reused every call, so
   // the caller needs its own copy, not a view into it.

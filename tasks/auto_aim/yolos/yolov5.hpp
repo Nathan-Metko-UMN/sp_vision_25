@@ -19,6 +19,7 @@
 
 #include <memory>
 
+#include "tasks/auto_aim/yolos/preprocess_kernel.hpp"
 #include "tasks/auto_aim/yolos/trt_engine.hpp"
 #endif
 
@@ -78,7 +79,19 @@ private:
   float * trt_output_host_ = nullptr;
   std::string trt_input_name_, trt_output_name_;
 
-  cv::Mat infer_tensorrt(const cv::Mat & input);
+  // GPU-resident preprocessing: fuses letterbox resize + BGR->RGB +
+  // normalize + HWC->CHW into one CUDA kernel (see preprocess_kernel.cu/
+  // .hpp), replacing the CPU cv::resize + cv::dnn::blobFromImage chain
+  // (~5ms combined, measured) with a raw-frame memcpy+H2D + kernel launch
+  // on otherwise-idle GPU (tegrastats showed ~15-30% average utilization).
+  // trt_raw_input_host_/device_ hold the *unprocessed* source frame (BGR
+  // uint8, HWC), lazily (re)allocated -- like letterbox_canvas_ -- only
+  // when the source resolution changes.
+  void * trt_raw_input_device_ = nullptr;
+  uint8_t * trt_raw_input_host_ = nullptr;  // pinned
+  int trt_raw_w_ = -1, trt_raw_h_ = -1;
+
+  cv::Mat infer_tensorrt_gpu_preprocess(const cv::Mat & bgr_img, int w, int h, double scale);
 #endif
 
   cv::Mat infer_openvino(const cv::Mat & input);

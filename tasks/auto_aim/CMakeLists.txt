@@ -35,6 +35,24 @@ find_library(TENSORRT_NVONNXPARSER_LIB nvonnxparser
 find_path(CUDA_INCLUDE_DIR cuda_runtime_api.h PATHS /usr/local/cuda/include)
 find_library(CUDA_CUDART_LIB cudart PATHS /usr/local/cuda/lib64 /usr/local/cuda/targets/aarch64-linux/lib /usr/local/cuda/targets/x86_64-linux/lib)
 
+# device: TENSORRT's preprocessing (letterbox resize + BGR->RGB + normalize
+# + HWC->CHW) runs as a single custom CUDA kernel on the GPU
+# (yolos/preprocess_kernel.cu) instead of on the CPU -- needs an actual CUDA
+# *compiler* (nvcc), not just the runtime libs found above. check_language
+# probes for it without hard-failing configure if it's absent (e.g.
+# TensorRT runtime libs installed but only the toolkit's runtime-only subset,
+# no nvcc -- see the Dockerfile's aarch64 CUDA install comment). 75/86/89
+# cover common desktop/laptop NVIDIA GPUs (Turing/Ampere/Ada); 87 is Jetson
+# Orin's own compute capability -- covers both this project's supported
+# platforms without needing CMAKE_CUDA_ARCHITECTURES=native (CMake 3.24+
+# only; this repo targets 3.16).
+include(CheckLanguage)
+check_language(CUDA)
+if(CMAKE_CUDA_COMPILER)
+    set(CMAKE_CUDA_ARCHITECTURES 75 86 87 89)
+    enable_language(CUDA)
+endif()
+
 add_subdirectory(planner/tinympc)
 
 add_library(auto_aim OBJECT 
@@ -68,11 +86,16 @@ else()
     message(STATUS "onnxruntime not found at /opt/onnxruntime -- device: CUDA will not be available (OpenVINO CPU/GPU only)")
 endif()
 
-if(TENSORRT_INCLUDE_DIR AND TENSORRT_NVINFER_LIB AND TENSORRT_NVONNXPARSER_LIB AND CUDA_INCLUDE_DIR AND CUDA_CUDART_LIB)
-    message(STATUS "TensorRT found -- device: TENSORRT (NVIDIA GPU) backend enabled for YOLOV5")
+if(TENSORRT_INCLUDE_DIR AND TENSORRT_NVINFER_LIB AND TENSORRT_NVONNXPARSER_LIB AND CUDA_INCLUDE_DIR
+   AND CUDA_CUDART_LIB AND CMAKE_CUDA_COMPILER)
+    message(STATUS "TensorRT + CUDA compiler found -- device: TENSORRT (NVIDIA GPU, GPU-side preprocessing) backend enabled for YOLOV5")
     target_compile_definitions(auto_aim PUBLIC HAVE_TENSORRT)
     target_include_directories(auto_aim PUBLIC ${TENSORRT_INCLUDE_DIR} ${CUDA_INCLUDE_DIR})
     target_link_libraries(auto_aim ${TENSORRT_NVINFER_LIB} ${TENSORRT_NVONNXPARSER_LIB} ${CUDA_CUDART_LIB})
+    target_sources(auto_aim PRIVATE yolos/preprocess_kernel.cu)
+elseif(TENSORRT_INCLUDE_DIR AND TENSORRT_NVINFER_LIB AND TENSORRT_NVONNXPARSER_LIB AND CUDA_INCLUDE_DIR
+       AND CUDA_CUDART_LIB)
+    message(STATUS "TensorRT found but no CUDA compiler (nvcc) -- device: TENSORRT will not be available (its preprocessing is a custom CUDA kernel, needs nvcc to build)")
 else()
     message(STATUS "TensorRT not found -- device: TENSORRT will not be available")
 endif()
