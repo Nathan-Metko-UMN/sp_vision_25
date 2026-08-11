@@ -36,17 +36,13 @@ MultiThreadDetector::MultiThreadDetector(const std::string & config_path, bool d
 
     // Fixed shapes: input 1x3x640x640, output 1x25200x22 -- same shapes
     // YOLOV5's own TensorRT path hardcodes (this .onnx model has no dynamic
-    // axes).
-    for (int i = 0; i < trt_engine_->getNbIOTensors(); i++) {
-      std::string name = trt_engine_->getIOTensorName(i);
-      if (trt_engine_->getTensorIOMode(name.c_str()) == nvinfer1::TensorIOMode::kINPUT) {
-        trt_input_name_ = name;
-      } else {
-        trt_output_name_ = name;
-      }
-    }
-    if (trt_input_name_.empty() || trt_output_name_.empty())
-      throw std::runtime_error("MultiThreadDetector: TensorRT engine has unexpected I/O tensor layout");
+    // axes). selected_indices (the fused-NMS engine's second output) has a
+    // data-dependent shape instead -- see trt_engine.hpp/
+    // scripts/onnx/fuse_nms.py and the TrtSlot::nms_allocator member.
+    auto io_names = trt_discover_io_names(*trt_engine_);
+    trt_input_name_ = io_names.input;
+    trt_output_name_ = io_names.output;
+    trt_selected_indices_name_ = io_names.selected_indices;
 
     for (auto & slot : trt_slots_) {
       if (cudaMalloc(&slot.input_device, 1 * 3 * 640 * 640 * sizeof(float)) != cudaSuccess)
@@ -59,13 +55,18 @@ MultiThreadDetector::MultiThreadDetector(const std::string & config_path, bool d
       if (cudaMallocHost(
             reinterpret_cast<void **>(&slot.output_host), 1 * 25200 * 22 * sizeof(float)) != cudaSuccess)
         throw std::runtime_error("MultiThreadDetector: cudaMallocHost (output) failed");
+      if (cudaMallocHost(
+            reinterpret_cast<void **>(&slot.selected_indices_host),
+            kMaxNmsOutputBoxes * 3 * sizeof(int64_t)) != cudaSuccess)
+        throw std::runtime_error("MultiThreadDetector: cudaMallocHost (selected_indices) failed");
+      slot.nms_allocator.allocate();
       if (cudaEventCreate(&slot.d2h_done) != cudaSuccess)
         throw std::runtime_error("MultiThreadDetector: cudaEventCreate failed");
     }
 
     tools::logger()->info(
-      "[MultiThreadDetector] initialized ! using TensorRT backend (ring size {}), engine={}", kTrtRingSize,
-      engine_path);
+      "[MultiThreadDetector] initialized ! using TensorRT backend (fused NMS, ring size {}), engine={}",
+      kTrtRingSize, engine_path);
     return;  // skip the OpenVINO compiled_model_ setup below -- unused in TensorRT mode
   }
 #endif
@@ -105,6 +106,7 @@ MultiThreadDetector::~MultiThreadDetector()
     if (slot.output_host) cudaFreeHost(slot.output_host);
     if (slot.raw_input_device) cudaFree(slot.raw_input_device);
     if (slot.raw_input_host) cudaFreeHost(slot.raw_input_host);
+    if (slot.selected_indices_host) cudaFreeHost(slot.selected_indices_host);
     if (slot.d2h_done) cudaEventDestroy(slot.d2h_done);
   }
   if (trt_stream_) cudaStreamDestroy(trt_stream_);
@@ -255,28 +257,54 @@ void MultiThreadDetector::push_tensorrt(cv::Mat & img, std::chrono::steady_clock
 
   trt_context_->setTensorAddress(trt_input_name_.c_str(), slot.input_device);
   trt_context_->setTensorAddress(trt_output_name_.c_str(), slot.output_device);
+  // selected_indices is a data-dependent-shape (DDS) output -- re-point the
+  // context's output allocator to this slot's own instance immediately
+  // before this slot's enqueueV3(), same reasoning as the setTensorAddress
+  // re-pointing above (single producer thread, strictly sequential calls).
+  trt_context_->setOutputAllocator(trt_selected_indices_name_.c_str(), &slot.nms_allocator);
+  slot.nms_allocator.reset_shape();
+
+  // Bracketed separately from the surrounding dispatch= timing: TensorRT's
+  // documented DDS contract has enqueueV3() not return until any DDS
+  // output's notifyShape() callback has fired, which may mean this call
+  // blocks until the fused NMS kernel has actually finished executing (not
+  // just been dispatched) -- unlike before fusion, where enqueueV3() was a
+  // near-instant "kernels submitted" call. This bracket is the direct,
+  // on-hardware answer to whether that's actually happening here, not
+  // something to infer from other numbers.
+  auto t_enqueue_start = std::chrono::steady_clock::now();
   if (!trt_context_->enqueueV3(trt_stream_)) {
     throw std::runtime_error("MultiThreadDetector: TensorRT enqueueV3 failed");
   }
+  auto t_enqueue_done = std::chrono::steady_clock::now();
+
+  // Per the same DDS contract, num_selected() should already be valid to
+  // read here (enqueueV3 already returned), no extra sync needed before
+  // this specific read -- only before the *data* the D2H copies below
+  // produce is actually read on the host.
+  int num_selected = slot.nms_allocator.num_selected();
 
   cudaMemcpyAsync(
     slot.output_host, slot.output_device, 1 * 25200 * 22 * sizeof(float), cudaMemcpyDeviceToHost,
     trt_stream_);
+  cudaMemcpyAsync(
+    slot.selected_indices_host, slot.nms_allocator.device_buffer(), num_selected * 3 * sizeof(int64_t),
+    cudaMemcpyDeviceToHost, trt_stream_);
   cudaEventRecord(slot.d2h_done, trt_stream_);
   slot.in_flight.store(true);
 
-  auto t2 = std::chrono::steady_clock::now();
   auto ms = [](auto a, auto b) { return std::chrono::duration<double, std::milli>(b - a).count(); };
   tools::logger()->info(
-    "[MT-TRT-TIMING] memcpy={:.2f}ms dispatch={:.2f}ms slot={}", ms(t0, t1), ms(t1, t2), slot_idx);
+    "[MT-TRT-TIMING] memcpy={:.2f}ms dispatch={:.2f}ms enqueueV3={:.2f}ms slot={} num_selected={}",
+    ms(t0, t1), ms(t1, t_enqueue_start), ms(t_enqueue_start, t_enqueue_done), slot_idx, num_selected);
 
-  trt_queue_.push({img.clone(), t, slot_idx, scale});
+  trt_queue_.push({img.clone(), t, slot_idx, scale, num_selected});
 }
 
 std::tuple<cv::Mat, std::chrono::steady_clock::time_point, std::list<Armor>>
 MultiThreadDetector::pop_tensorrt()
 {
-  auto [img, t, slot_idx, scale] = trt_queue_.pop();
+  auto [img, t, slot_idx, scale, num_selected] = trt_queue_.pop();
   auto & slot = trt_slots_[slot_idx];
 
   // Wait ONLY for this slot's D2H copy -- not a full stream sync, which
@@ -284,12 +312,13 @@ MultiThreadDetector::pop_tensorrt()
   // may have already enqueued by now.
   cudaEventSynchronize(slot.d2h_done);
 
-  // View, not clone: consumed synchronously by postprocess() right below,
-  // and the slot is provably still ours -- in_flight (and therefore
-  // push_tensorrt()'s ability to reuse this slot) isn't cleared until after
-  // this line runs.
+  // View, not clone: consumed synchronously by postprocess_from_selected_
+  // indices() right below, and the slot is provably still ours -- in_flight
+  // (and therefore push_tensorrt()'s ability to reuse this slot) isn't
+  // cleared until after this line runs.
   cv::Mat output(25200, 22, CV_32F, slot.output_host);
-  auto armors = yolo_.postprocess(scale, output, img, 0);  //暂不支持ROI
+  auto armors = yolo_.postprocess_from_selected_indices(
+    scale, output, slot.selected_indices_host, num_selected, img, 0);  //暂不支持ROI
 
   // Only now is this slot truly free -- wake any push_tensorrt() call
   // blocked waiting to reuse it (see the wait in push_tensorrt() and the

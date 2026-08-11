@@ -491,6 +491,70 @@ disables that ramping -- after running it, `infer` time alone dropped from
 thing worth doing *before* concluding a GPU backend "isn't much faster" on
 Jetson -- verify clocks are actually locked first.
 
+#### GPU-side preprocessing and fused NMS
+
+Two further optimizations on top of the baseline above, both specific to
+`device: TENSORRT`:
+
+**GPU-resident preprocessing** (`YOLOV5::infer_tensorrt_gpu_preprocess()`,
+`preprocess_kernel.cu`): the CPU letterbox resize + `cv::dnn::blobFromImage`
+chain (~5ms combined) is replaced by a raw-frame memcpy+H2D followed by a
+single custom CUDA kernel fusing letterbox resize + BGR→RGB + normalize +
+HWC→CHW, running on the GPU (measured sitting at 15-30% average utilization
+otherwise -- plenty of idle headroom). Cut single-threaded `detect()` from
+~11.6ms to ~6.7ms.
+
+**Fused NMS** (`tasks/auto_aim/yolos/trt_engine.hpp`, `trt_nms_allocator.hpp/
+.cpp`, `scripts/onnx/fuse_nms.py`): NMS suppression itself now runs inside
+the TensorRT engine via an ONNX `NonMaxSuppression` node, instead of a
+25200-row CPU scan (`YOLOV5::parse()`) every frame. `assets/yolov5.onnx` was
+modified in place by `scripts/onnx/fuse_nms.py` -- purely additive: the
+original `output/sink_port_0` output ([1,25200,22]) is untouched, a second
+output `selected_indices` ([-1,3] int64, `[batch_index, class_index,
+box_index]` triples) is added. C++ gathers the handful (0-64) of surviving
+rows directly from the unmodified original output using
+`selected_indices`' box_index column -- no `cv::dnn::NMSBoxes` call needed
+for the TensorRT path anymore (`YOLOV5::parse_from_selected_indices()`).
+
+**Why this needed more than just adding an output to the graph:**
+`selected_indices` has a *data-dependent shape* (DDS) -- its row count is
+only known once NMS actually executes, not from input shapes. TensorRT does
+**not** report this via `context->getTensorShape()` after
+`enqueueV3()`+sync (that returns -1 for a DDS output); it instead requires
+implementing `nvinfer1::IOutputAllocator` (`trt_nms_allocator.hpp`):
+`reallocateOutputAsync()` hands back a pre-sized device buffer,
+`notifyShape()` reports the real resulting shape once known, both
+registered via `context->setOutputAllocator(...)`. `MultiThreadDetector`'s
+ring-buffered async path needs one allocator instance *per slot* (not
+shared), re-pointed via `setOutputAllocator()` immediately before each
+slot's `enqueueV3()` call -- the same "re-point immediately before enqueue"
+pattern already used for `setTensorAddress()` on that shared context.
+
+**If `assets/yolov5.onnx` is ever regenerated** (e.g. a retrained model
+re-exported via `openvino2onnx`, see §5.5/§5.6 above for that tool), re-run
+`python scripts/onnx/fuse_nms.py` afterward to re-apply the NMS fusion (it
+refuses to run on an already-fused graph -- start from a fresh
+`openvino2onnx` export), and delete any local `assets/yolov5.engine` so it
+gets rebuilt from the newly-fused onnx (`trt_build_or_load_engine()` has no
+staleness check against the `.onnx` it was built from -- it'll happily load
+a stale cached engine with the old I/O layout, which then fails loudly with
+an "unexpected fused-NMS layout" error at construction, not silently).
+`scripts/onnx/requirements.txt` pins the exact `onnx`/`onnx_graphsurgeon`
+versions validated against this graph's specific op mix -- other versions
+were found to break during development (missing/renamed internal APIs).
+
+**Measured impact:** GPU compute time for detection + NMS combined averages
+~4.0ms (NMS itself adds under 0.5ms on top of plain inference) -- CPU-side
+`[PARSE-TIMING]` for the TensorRT path dropped from ~1.4-1.8ms (25200-row
+scan) to near-zero (0-64 rows). One open question flagged during design and
+worth re-checking after any TensorRT/JetPack upgrade: TensorRT's documented
+DDS contract implies `enqueueV3()` may not return until the fused NMS kernel
+has actually finished executing (not merely been dispatched), which could
+reduce how much the async ring buffer's cross-frame overlap helps
+specifically (see the `enqueueV3=` timing bucket added to `[MT-TRT-TIMING]`
+in `push_tensorrt()` -- included specifically to make this directly
+observable rather than something to infer).
+
 ## 6. Known gaps / things to verify on real hardware
 
 - `device: TENSORRT` (§5.7) needs `/usr/local/cuda-12.6` bind-mounted from

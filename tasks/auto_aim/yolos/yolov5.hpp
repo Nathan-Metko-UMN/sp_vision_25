@@ -21,6 +21,7 @@
 
 #include "tasks/auto_aim/yolos/preprocess_kernel.hpp"
 #include "tasks/auto_aim/yolos/trt_engine.hpp"
+#include "tasks/auto_aim/yolos/trt_nms_allocator.hpp"
 #endif
 
 #include "tasks/auto_aim/armor.hpp"
@@ -39,6 +40,19 @@ public:
 
   std::list<Armor> postprocess(
     double scale, cv::Mat & output, const cv::Mat & bgr_img, int frame_count) override;
+
+#ifdef HAVE_TENSORRT
+  // For device: TENSORRT's fused-NMS engine (see trt_engine.hpp/
+  // scripts/onnx/fuse_nms.py): NMS suppression already happened on the GPU,
+  // selected_indices' box_index column gathers the surviving rows directly
+  // out of raw_output. Used by MultiThreadDetector (async path) instead of
+  // postprocess() -- see YOLOBase::postprocess_from_selected_indices for
+  // why this is a virtual method with a default-throwing body rather than
+  // pure virtual (YOLOV8/YOLO11 never support it).
+  std::list<Armor> postprocess_from_selected_indices(
+    double scale, cv::Mat & raw_output, const int64_t * selected_indices, int num_selected,
+    const cv::Mat & bgr_img, int frame_count) override;
+#endif
 
 private:
   std::string device_, model_path_;
@@ -91,7 +105,28 @@ private:
   uint8_t * trt_raw_input_host_ = nullptr;  // pinned
   int trt_raw_w_ = -1, trt_raw_h_ = -1;
 
-  cv::Mat infer_tensorrt_gpu_preprocess(const cv::Mat & bgr_img, int w, int h, double scale);
+  // Fused-NMS engine's second output (see trt_engine.hpp/
+  // scripts/onnx/fuse_nms.py): selected_indices, a data-dependent-shape
+  // (DDS) tensor of [batch_index, class_index, box_index] triples for
+  // whichever of the 25200 candidate rows survived GPU-side NMS.
+  // trt_nms_allocator_ is the IOutputAllocator TensorRT requires for any
+  // DDS output (context->getTensorShape() post-enqueue doesn't report a
+  // DDS output's real shape); trt_selected_indices_host_ is the pinned
+  // host-side readback buffer, sized to the worst case (kMaxNmsOutputBoxes).
+  std::string trt_selected_indices_name_;
+  TrtNmsOutputAllocator trt_nms_allocator_;
+  int64_t * trt_selected_indices_host_ = nullptr;  // pinned, kMaxNmsOutputBoxes*3 int64
+
+  struct TrtInferResult
+  {
+    cv::Mat raw_output;                     // 25200x22, cloned (unchanged from before fusion)
+    std::vector<int64_t> selected_indices;  // num_selected*3 int64 triples
+  };
+  TrtInferResult infer_tensorrt_gpu_preprocess(const cv::Mat & bgr_img, int w, int h, double scale);
+
+  std::list<Armor> parse_from_selected_indices(
+    double scale, const cv::Mat & raw_output, const int64_t * selected_indices, int num_selected,
+    const cv::Mat & bgr_img, int frame_count);
 #endif
 
   cv::Mat infer_openvino(const cv::Mat & input);
@@ -117,6 +152,13 @@ private:
   cv::Point2f get_center_norm(const cv::Mat & bgr_img, const cv::Point2f & center) const;
 
   std::list<Armor> parse(double scale, cv::Mat & output, const cv::Mat & bgr_img, int frame_count);
+
+  // Shared tail of parse() and (TensorRT-only) parse_from_selected_indices():
+  // name/type filtering, optional traditional-CV keypoint refinement,
+  // center_norm, and debug drawing -- backend-independent per-detection
+  // postprocessing that must behave identically regardless of which path
+  // produced the (still unfiltered/unrefined) armors list.
+  void finalize_armors(std::list<Armor> & armors, const cv::Mat & bgr_img, int frame_count);
 
   void save(const Armor & armor) const;
   void draw_detections(const cv::Mat & img, const std::list<Armor> & armors, int frame_count) const;

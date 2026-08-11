@@ -102,22 +102,25 @@ YOLOV5::YOLOV5(const std::string & config_path, bool debug)
     if (cudaMallocHost(reinterpret_cast<void **>(&trt_output_host_), 1 * 25200 * 22 * sizeof(float)) !=
         cudaSuccess)
       throw std::runtime_error("YOLOV5: cudaMallocHost (output) failed");
+    if (cudaMallocHost(
+          reinterpret_cast<void **>(&trt_selected_indices_host_),
+          kMaxNmsOutputBoxes * 3 * sizeof(int64_t)) != cudaSuccess)
+      throw std::runtime_error("YOLOV5: cudaMallocHost (selected_indices) failed");
 
-    for (int i = 0; i < trt_engine_->getNbIOTensors(); i++) {
-      std::string name = trt_engine_->getIOTensorName(i);
-      if (trt_engine_->getTensorIOMode(name.c_str()) == nvinfer1::TensorIOMode::kINPUT) {
-        trt_input_name_ = name;
-      } else {
-        trt_output_name_ = name;
-      }
-    }
-    if (trt_input_name_.empty() || trt_output_name_.empty())
-      throw std::runtime_error("YOLOV5: TensorRT engine has unexpected I/O tensor layout");
+    auto io_names = trt_discover_io_names(*trt_engine_);
+    trt_input_name_ = io_names.input;
+    trt_output_name_ = io_names.output;
+    trt_selected_indices_name_ = io_names.selected_indices;
 
     trt_context_->setTensorAddress(trt_input_name_.c_str(), trt_input_device_);
     trt_context_->setTensorAddress(trt_output_name_.c_str(), trt_output_device_);
+    // selected_indices has a data-dependent shape -- no setTensorAddress
+    // for it; the IOutputAllocator interface is how TensorRT gets both the
+    // buffer and the resulting shape for a DDS output.
+    trt_nms_allocator_.allocate();
+    trt_context_->setOutputAllocator(trt_selected_indices_name_.c_str(), &trt_nms_allocator_);
 
-    tools::logger()->info("YOLOV5: using TensorRT backend, engine={}", engine_path);
+    tools::logger()->info("YOLOV5: using TensorRT backend (fused NMS), engine={}", engine_path);
 #else
     throw std::runtime_error(
       "device: TENSORRT requires building with TensorRT support, but TensorRT "
@@ -157,6 +160,7 @@ YOLOV5::~YOLOV5()
   if (trt_output_host_) cudaFreeHost(trt_output_host_);
   if (trt_raw_input_device_) cudaFree(trt_raw_input_device_);
   if (trt_raw_input_host_) cudaFreeHost(trt_raw_input_host_);
+  if (trt_selected_indices_host_) cudaFreeHost(trt_selected_indices_host_);
   if (trt_stream_) cudaStreamDestroy(trt_stream_);
 #endif
 }
@@ -193,9 +197,23 @@ std::list<Armor> YOLOV5::detect(const cv::Mat & raw_img, int frame_count)
     // GPU-resident preprocessing (see infer_tensorrt_gpu_preprocess): the
     // CPU letterbox resize + blobFromImage chain below is skipped entirely
     // for this backend -- bgr_img (unresized, original resolution) is
-    // handed straight to the GPU.
-    output = infer_tensorrt_gpu_preprocess(bgr_img, w, h, scale);
-  } else
+    // handed straight to the GPU. NMS suppression also already happened on
+    // the GPU (see trt_engine.hpp/scripts/onnx/fuse_nms.py), so the
+    // TensorRT branch below calls parse_from_selected_indices() instead of
+    // parse() -- a tiny (0-64 row) postprocess over GPU-selected survivors
+    // rather than a 25200-row CPU scan.
+    auto trt_result = infer_tensorrt_gpu_preprocess(bgr_img, w, h, scale);
+    auto t_infer_done = std::chrono::steady_clock::now();
+    int num_selected = static_cast<int>(trt_result.selected_indices.size() / 3);
+    auto result = parse_from_selected_indices(
+      scale, trt_result.raw_output, trt_result.selected_indices.data(), num_selected, raw_img,
+      frame_count);
+    auto t_parse_done = std::chrono::steady_clock::now();
+    tools::logger()->info(
+      "[PARSE-TIMING] parse={:.3f}ms num_selected={}",
+      std::chrono::duration<double, std::milli>(t_parse_done - t_infer_done).count(), num_selected);
+    return result;
+  }
 #endif
   {
     // preproces
@@ -309,7 +327,8 @@ cv::Mat YOLOV5::infer_cuda(const cv::Mat & input)
 // and enqueueV3 -- all three are enqueued on the same trt_stream_, and CUDA
 // streams execute in FIFO order, so each is guaranteed to see the previous
 // one's writes without an explicit intermediate cudaStreamSynchronize.
-cv::Mat YOLOV5::infer_tensorrt_gpu_preprocess(const cv::Mat & bgr_img, int w, int h, double scale)
+YOLOV5::TrtInferResult YOLOV5::infer_tensorrt_gpu_preprocess(
+  const cv::Mat & bgr_img, int w, int h, double scale)
 {
   auto t0 = std::chrono::steady_clock::now();
 
@@ -345,30 +364,44 @@ cv::Mat YOLOV5::infer_tensorrt_gpu_preprocess(const cv::Mat & bgr_img, int w, in
     static_cast<float *>(trt_input_device_), w, h, static_cast<float>(scale), trt_stream_);
   auto t2 = std::chrono::steady_clock::now();
 
+  trt_nms_allocator_.reset_shape();
   if (!trt_context_->enqueueV3(trt_stream_)) {
     throw std::runtime_error("YOLOV5: TensorRT enqueueV3 failed");
   }
   cudaStreamSynchronize(trt_stream_);
   auto t3 = std::chrono::steady_clock::now();
 
+  // num_selected() is safe to read here: the preceding cudaStreamSynchronize
+  // waited for everything enqueued up to and including enqueueV3 (which per
+  // TensorRT's documented data-dependent-shape contract does not return
+  // until any DDS output's notifyShape() callback has already fired), so
+  // trt_nms_allocator_'s shape state is guaranteed known by this point.
+  int num_selected = trt_nms_allocator_.num_selected();
+
   cudaMemcpyAsync(
     trt_output_host_, trt_output_device_, 1 * 25200 * 22 * sizeof(float), cudaMemcpyDeviceToHost,
     trt_stream_);
+  cudaMemcpyAsync(
+    trt_selected_indices_host_, trt_nms_allocator_.device_buffer(), num_selected * 3 * sizeof(int64_t),
+    cudaMemcpyDeviceToHost, trt_stream_);
   cudaStreamSynchronize(trt_stream_);
   auto t4 = std::chrono::steady_clock::now();
 
   auto ms = [](auto a, auto b) { return std::chrono::duration<double, std::milli>(b - a).count(); };
   tools::logger()->info(
     // "gpu_wait" = time waiting for the preprocessing kernel + TensorRT
-    // inference to actually finish executing on the GPU (both dispatched
-    // async at t2, so this bucket isn't purely "infer" anymore -- the sync
-    // at t3 can't distinguish where GPU time went between the two).
-    "[TRT-TIMING] memcpy={:.2f}ms dispatch={:.2f}ms gpu_wait={:.2f}ms d2h={:.2f}ms", ms(t0, t1),
-    ms(t1, t2), ms(t2, t3), ms(t3, t4));
+    // inference + fused NMS to actually finish executing on the GPU (all
+    // dispatched async at t2, so this bucket isn't purely "infer" anymore --
+    // the sync at t3 can't distinguish where GPU time went between them).
+    "[TRT-TIMING] memcpy={:.2f}ms dispatch={:.2f}ms gpu_wait={:.2f}ms d2h={:.2f}ms num_selected={}",
+    ms(t0, t1), ms(t1, t2), ms(t2, t3), ms(t3, t4), num_selected);
 
-  // clone(): trt_output_host_ is a persistent buffer reused every call, so
-  // the caller needs its own copy, not a view into it.
-  return cv::Mat(25200, 22, CV_32F, trt_output_host_).clone();
+  // clone()/copy: trt_output_host_/trt_selected_indices_host_ are
+  // persistent buffers reused every call, so the caller needs its own copy,
+  // not a view into them.
+  return TrtInferResult{
+    cv::Mat(25200, 22, CV_32F, trt_output_host_).clone(),
+    std::vector<int64_t>(trt_selected_indices_host_, trt_selected_indices_host_ + num_selected * 3)};
 }
 #endif
 
@@ -465,6 +498,12 @@ std::list<Armor> YOLOV5::parse(
     }
   }
 
+  finalize_armors(armors, bgr_img, frame_count);
+  return armors;
+}
+
+void YOLOV5::finalize_armors(std::list<Armor> & armors, const cv::Mat & bgr_img, int frame_count)
+{
   tmp_img_ = bgr_img;
   for (auto it = armors.begin(); it != armors.end();) {
     if (!check_name(*it)) {
@@ -484,9 +523,86 @@ std::list<Armor> YOLOV5::parse(
   }
 
   if (debug_) draw_detections(bgr_img, armors, frame_count);
+}
 
+#ifdef HAVE_TENSORRT
+// TensorRT fused-NMS path: selected_indices' box_index column (index 2 of
+// each 3-int64 [batch_index, class_index, box_index] triple -- batch_index
+// and class_index are always 0, since NMS here runs over a single "class"
+// (objectness), see scripts/onnx/fuse_nms.py) directly indexes raw_output,
+// which is otherwise byte-identical to what parse() scans (the graph
+// surgery is purely additive). No cv::dnn::NMSBoxes call needed --
+// suppression already happened on the GPU. Confidence isn't part of NMS's
+// ONNX output (indices only), so it's recomputed here -- cheap, at most
+// kMaxNmsOutputBoxes sigmoid() calls versus parse()'s up to 25200.
+std::list<Armor> YOLOV5::parse_from_selected_indices(
+  double scale, const cv::Mat & raw_output, const int64_t * selected_indices, int num_selected,
+  const cv::Mat & bgr_img, int frame_count)
+{
+  std::list<Armor> armors;
+  const float fscale = static_cast<float>(scale);
+
+  for (int i = 0; i < num_selected; i++) {
+    int64_t box_idx = selected_indices[i * 3 + 2];
+    const float * row = raw_output.ptr<float>(static_cast<int>(box_idx));
+
+    double score = sigmoid(row[8]);
+
+    int _color_id = 0;
+    float best_color = row[9];
+    for (int c = 1; c < 4; c++) {
+      if (row[9 + c] > best_color) {
+        best_color = row[9 + c];
+        _color_id = c;
+      }
+    }
+    int _class_id = 0;
+    float best_class = row[13];
+    for (int c = 1; c < 9; c++) {
+      if (row[13 + c] > best_class) {
+        best_class = row[13 + c];
+        _class_id = c;
+      }
+    }
+
+    std::vector<cv::Point2f> armor_key_points{
+      {row[0] / fscale, row[1] / fscale},
+      {row[6] / fscale, row[7] / fscale},
+      {row[4] / fscale, row[5] / fscale},
+      {row[2] / fscale, row[3] / fscale},
+    };
+
+    float min_x = armor_key_points[0].x;
+    float max_x = armor_key_points[0].x;
+    float min_y = armor_key_points[0].y;
+    float max_y = armor_key_points[0].y;
+    for (size_t k = 1; k < armor_key_points.size(); k++) {
+      if (armor_key_points[k].x < min_x) min_x = armor_key_points[k].x;
+      if (armor_key_points[k].x > max_x) max_x = armor_key_points[k].x;
+      if (armor_key_points[k].y < min_y) min_y = armor_key_points[k].y;
+      if (armor_key_points[k].y > max_y) max_y = armor_key_points[k].y;
+    }
+    cv::Rect rect(min_x, min_y, max_x - min_x, max_y - min_y);
+
+    if (use_roi_) {
+      armors.emplace_back(
+        _color_id, _class_id, static_cast<float>(score), rect, armor_key_points, offset_);
+    } else {
+      armors.emplace_back(_color_id, _class_id, static_cast<float>(score), rect, armor_key_points);
+    }
+  }
+
+  finalize_armors(armors, bgr_img, frame_count);
   return armors;
 }
+
+std::list<Armor> YOLOV5::postprocess_from_selected_indices(
+  double scale, cv::Mat & raw_output, const int64_t * selected_indices, int num_selected,
+  const cv::Mat & bgr_img, int frame_count)
+{
+  return parse_from_selected_indices(scale, raw_output, selected_indices, num_selected, bgr_img, frame_count);
+}
+#endif
 
 bool YOLOV5::check_name(const Armor & armor) const
 {

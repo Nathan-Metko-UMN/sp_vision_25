@@ -70,6 +70,7 @@ add_library(auto_aim OBJECT
     yolos/yolov8.cpp
     yolos/yolo11.cpp
     yolos/trt_engine.cpp
+    yolos/trt_nms_allocator.cpp
     multithread/commandgener.cpp
     multithread/mt_detector.cpp
     planner/planner.cpp

@@ -87,6 +87,31 @@ void trt_build_or_load_engine(
   if (!engine) throw std::runtime_error("TensorRT: failed to deserialize freshly-built engine");
 }
 
+TrtIONames trt_discover_io_names(nvinfer1::ICudaEngine & engine)
+{
+  TrtIONames names;
+  for (int i = 0; i < engine.getNbIOTensors(); i++) {
+    std::string name = engine.getIOTensorName(i);
+    if (engine.getTensorIOMode(name.c_str()) == nvinfer1::TensorIOMode::kINPUT) {
+      names.input = name;
+    } else if (name == kTrtOutputTensorName) {
+      names.output = name;
+    } else if (name == kTrtSelectedIndicesTensorName) {
+      names.selected_indices = name;
+    } else {
+      throw std::runtime_error("TensorRT: engine has unexpected I/O tensor '" + name + "'");
+    }
+  }
+  if (names.input.empty() || names.output.empty() || names.selected_indices.empty()) {
+    throw std::runtime_error(
+      "TensorRT: engine I/O tensors don't match the expected fused-NMS layout (found input='" +
+      names.input + "' output='" + names.output + "' selected_indices='" + names.selected_indices +
+      "' -- likely a stale .engine cached from before NMS fusion, or an unfused .onnx; "
+      "delete the local .engine and/or re-run scripts/onnx/fuse_nms.py)");
+  }
+  return names;
+}
+
 }  // namespace auto_aim
 
 #endif  // HAVE_TENSORRT

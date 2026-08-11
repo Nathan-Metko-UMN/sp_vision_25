@@ -18,6 +18,7 @@
 
 #include "tasks/auto_aim/yolos/preprocess_kernel.hpp"
 #include "tasks/auto_aim/yolos/trt_engine.hpp"
+#include "tasks/auto_aim/yolos/trt_nms_allocator.hpp"
 #endif
 
 #include "tasks/auto_aim/yolos/yolov5.hpp"
@@ -86,7 +87,7 @@ private:
   // mt_standard.cpp), so there's no cross-thread race on the context.
   std::unique_ptr<nvinfer1::IExecutionContext> trt_context_;
   cudaStream_t trt_stream_ = nullptr;
-  std::string trt_input_name_, trt_output_name_;
+  std::string trt_input_name_, trt_output_name_, trt_selected_indices_name_;
 
   struct TrtSlot
   {
@@ -106,6 +107,14 @@ private:
     // share), but keeping it per-slot too avoids the asymmetry.
     void * raw_input_device = nullptr;
     uint8_t * raw_input_host = nullptr;  // pinned
+    // Fused-NMS engine's second output (see trt_engine.hpp/
+    // scripts/onnx/fuse_nms.py) -- own IOutputAllocator instance per slot,
+    // same reasoning as the other per-slot buffers above: context->
+    // setOutputAllocator() is re-pointed to this slot's instance
+    // immediately before this slot's enqueueV3(), mirroring how
+    // setTensorAddress() is already re-pointed per-slot.
+    TrtNmsOutputAllocator nms_allocator;
+    int64_t * selected_indices_host = nullptr;  // pinned, kMaxNmsOutputBoxes*3 int64
     cudaEvent_t d2h_done = nullptr;
     // True from the moment push_tensorrt() dispatches this slot's GPU work
     // until pop_tensorrt() has *fully read* its result (not merely until
@@ -135,10 +144,15 @@ private:
   // changes (never, in practice, for a fixed camera/ROI).
   int trt_raw_w_ = -1, trt_raw_h_ = -1;
 
-  // {img.clone(), t, slot_index, letterbox_scale} -- FIFO order matches
-  // slot-reuse order (the ring is strictly round-robin), so no separate
-  // slot->queue-entry lookup is needed.
-  tools::ThreadSafeQueue<std::tuple<cv::Mat, std::chrono::steady_clock::time_point, int, double>>
+  // {img.clone(), t, slot_index, letterbox_scale, num_selected} -- FIFO
+  // order matches slot-reuse order (the ring is strictly round-robin), so
+  // no separate slot->queue-entry lookup is needed. num_selected is
+  // captured once in push_tensorrt() right after enqueueV3() and threaded
+  // through here rather than re-read from the slot's nms_allocator a
+  // second time in pop_tensorrt() -- avoids two logically-separate reads of
+  // the same allocator state ever disagreeing.
+  tools::ThreadSafeQueue<
+    std::tuple<cv::Mat, std::chrono::steady_clock::time_point, int, double, int>>
     trt_queue_{16, [] { tools::logger()->debug("[MultiThreadDetector] TRT queue is full!"); }};
 
   void push_tensorrt(cv::Mat & img, std::chrono::steady_clock::time_point t);
