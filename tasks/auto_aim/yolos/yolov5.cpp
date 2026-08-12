@@ -3,8 +3,10 @@
 #include <fmt/chrono.h>
 #include <yaml-cpp/yaml.h>
 
+#include <algorithm>
 #include <array>
 #include <chrono>
+#include <cmath>
 #include <filesystem>
 #include <fstream>
 
@@ -102,23 +104,37 @@ YOLOV5::YOLOV5(const std::string & config_path, bool debug)
     if (cudaMallocHost(reinterpret_cast<void **>(&trt_output_host_), 1 * 25200 * 22 * sizeof(float)) !=
         cudaSuccess)
       throw std::runtime_error("YOLOV5: cudaMallocHost (output) failed");
+    // EfficientNMS_TRT's four outputs are all FIXED shape (padded to
+    // kMaxNmsOutputBoxes) -- no IOutputAllocator/data-dependent-shape
+    // machinery needed, just plain device buffers + setTensorAddress like
+    // input/output already use. detection_boxes/detection_classes are
+    // allocated (every output tensor needs a bound address) but never read
+    // back -- see the member comments in yolov5.hpp for why.
+    if (cudaMalloc(&trt_num_detections_device_, sizeof(int32_t)) != cudaSuccess)
+      throw std::runtime_error("YOLOV5: cudaMalloc (num_detections) failed");
+    if (cudaMalloc(&trt_detection_boxes_device_, kMaxNmsOutputBoxes * 4 * sizeof(float)) != cudaSuccess)
+      throw std::runtime_error("YOLOV5: cudaMalloc (detection_boxes) failed");
+    if (cudaMalloc(&trt_detection_scores_device_, kMaxNmsOutputBoxes * sizeof(float)) != cudaSuccess)
+      throw std::runtime_error("YOLOV5: cudaMalloc (detection_scores) failed");
+    if (cudaMalloc(&trt_detection_classes_device_, kMaxNmsOutputBoxes * sizeof(int32_t)) != cudaSuccess)
+      throw std::runtime_error("YOLOV5: cudaMalloc (detection_classes) failed");
+    if (cudaMallocHost(reinterpret_cast<void **>(&trt_num_detections_host_), sizeof(int32_t)) != cudaSuccess)
+      throw std::runtime_error("YOLOV5: cudaMallocHost (num_detections) failed");
     if (cudaMallocHost(
-          reinterpret_cast<void **>(&trt_selected_indices_host_),
-          kMaxNmsOutputBoxes * 3 * sizeof(int64_t)) != cudaSuccess)
-      throw std::runtime_error("YOLOV5: cudaMallocHost (selected_indices) failed");
+          reinterpret_cast<void **>(&trt_detection_scores_host_),
+          kMaxNmsOutputBoxes * sizeof(float)) != cudaSuccess)
+      throw std::runtime_error("YOLOV5: cudaMallocHost (detection_scores) failed");
 
     auto io_names = trt_discover_io_names(*trt_engine_);
     trt_input_name_ = io_names.input;
     trt_output_name_ = io_names.output;
-    trt_selected_indices_name_ = io_names.selected_indices;
 
     trt_context_->setTensorAddress(trt_input_name_.c_str(), trt_input_device_);
     trt_context_->setTensorAddress(trt_output_name_.c_str(), trt_output_device_);
-    // selected_indices has a data-dependent shape -- no setTensorAddress
-    // for it; the IOutputAllocator interface is how TensorRT gets both the
-    // buffer and the resulting shape for a DDS output.
-    trt_nms_allocator_.allocate();
-    trt_context_->setOutputAllocator(trt_selected_indices_name_.c_str(), &trt_nms_allocator_);
+    trt_context_->setTensorAddress(io_names.num_detections.c_str(), trt_num_detections_device_);
+    trt_context_->setTensorAddress(io_names.detection_boxes.c_str(), trt_detection_boxes_device_);
+    trt_context_->setTensorAddress(io_names.detection_scores.c_str(), trt_detection_scores_device_);
+    trt_context_->setTensorAddress(io_names.detection_classes.c_str(), trt_detection_classes_device_);
 
     tools::logger()->info("YOLOV5: using TensorRT backend (fused NMS), engine={}", engine_path);
 #else
@@ -160,13 +176,20 @@ YOLOV5::~YOLOV5()
   if (trt_output_host_) cudaFreeHost(trt_output_host_);
   if (trt_raw_input_device_) cudaFree(trt_raw_input_device_);
   if (trt_raw_input_host_) cudaFreeHost(trt_raw_input_host_);
-  if (trt_selected_indices_host_) cudaFreeHost(trt_selected_indices_host_);
+  if (trt_num_detections_device_) cudaFree(trt_num_detections_device_);
+  if (trt_detection_boxes_device_) cudaFree(trt_detection_boxes_device_);
+  if (trt_detection_scores_device_) cudaFree(trt_detection_scores_device_);
+  if (trt_detection_classes_device_) cudaFree(trt_detection_classes_device_);
+  if (trt_num_detections_host_) cudaFreeHost(trt_num_detections_host_);
+  if (trt_detection_scores_host_) cudaFreeHost(trt_detection_scores_host_);
   if (trt_stream_) cudaStreamDestroy(trt_stream_);
 #endif
 }
 
 std::list<Armor> YOLOV5::detect(const cv::Mat & raw_img, int frame_count)
 {
+  auto t_detect_start = std::chrono::steady_clock::now();
+
   if (raw_img.empty()) {
     tools::logger()->warn("Empty img!, camera drop!");
     return std::list<Armor>();
@@ -198,20 +221,30 @@ std::list<Armor> YOLOV5::detect(const cv::Mat & raw_img, int frame_count)
     // CPU letterbox resize + blobFromImage chain below is skipped entirely
     // for this backend -- bgr_img (unresized, original resolution) is
     // handed straight to the GPU. NMS suppression also already happened on
-    // the GPU (see trt_engine.hpp/scripts/onnx/fuse_nms.py), so the
-    // TensorRT branch below calls parse_from_selected_indices() instead of
+    // the GPU (see trt_engine.hpp/scripts/onnx/fuse_efficient_nms.py), so
+    // the TensorRT branch below calls parse_from_efficient_nms() instead of
     // parse() -- a tiny (0-64 row) postprocess over GPU-selected survivors
     // rather than a 25200-row CPU scan.
-    auto trt_result = infer_tensorrt_gpu_preprocess(bgr_img, w, h, scale);
+    auto trt_result = infer_tensorrt_gpu_preprocess(bgr_img, w, h, scale, frame_count);
     auto t_infer_done = std::chrono::steady_clock::now();
-    int num_selected = static_cast<int>(trt_result.selected_indices.size() / 3);
-    auto result = parse_from_selected_indices(
-      scale, trt_result.raw_output, trt_result.selected_indices.data(), num_selected, raw_img,
-      frame_count);
+    auto result = parse_from_efficient_nms(
+      scale, trt_result.raw_output, trt_result.detection_scores.data(), trt_result.num_detections,
+      raw_img, frame_count);
     auto t_parse_done = std::chrono::steady_clock::now();
+    auto parse_ms = std::chrono::duration<double, std::milli>(t_parse_done - t_infer_done).count();
     tools::logger()->info(
-      "[PARSE-TIMING] parse={:.3f}ms num_selected={}",
-      std::chrono::duration<double, std::milli>(t_parse_done - t_infer_done).count(), num_selected);
+      "[PARSE-TIMING] parse={:.3f}ms num_detections={}", parse_ms, trt_result.num_detections);
+    parse_stats_.add(parse_ms, frame_count);
+    // This is the number that actually dictates achievable FPS for the
+    // single-threaded path (1000/mean here is the sustainable ceiling) --
+    // everything above (memcpy/dispatch/enqueueV3/gpu_wait_and_d2h/parse)
+    // are its components, not the whole picture; this timer wraps the
+    // entire detect() call, including the ROI/scale setup those brackets
+    // don't cover.
+    double detect_total_ms =
+      std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t_detect_start)
+        .count();
+    detect_total_stats_.add(detect_total_ms, frame_count);
     return result;
   }
 #endif
@@ -250,9 +283,12 @@ std::list<Armor> YOLOV5::detect(const cv::Mat & raw_img, int frame_count)
   auto t_infer_done = std::chrono::steady_clock::now();
   auto result = parse(scale, output, raw_img, frame_count);
   auto t_parse_done = std::chrono::steady_clock::now();
-  tools::logger()->info(
-    "[PARSE-TIMING] parse={:.2f}ms",
-    std::chrono::duration<double, std::milli>(t_parse_done - t_infer_done).count());
+  auto parse_ms = std::chrono::duration<double, std::milli>(t_parse_done - t_infer_done).count();
+  tools::logger()->info("[PARSE-TIMING] parse={:.2f}ms", parse_ms);
+  parse_stats_.add(parse_ms, frame_count);
+  double detect_total_ms =
+    std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t_detect_start).count();
+  detect_total_stats_.add(detect_total_ms, frame_count);
   return result;
 }
 
@@ -328,7 +364,7 @@ cv::Mat YOLOV5::infer_cuda(const cv::Mat & input)
 // streams execute in FIFO order, so each is guaranteed to see the previous
 // one's writes without an explicit intermediate cudaStreamSynchronize.
 YOLOV5::TrtInferResult YOLOV5::infer_tensorrt_gpu_preprocess(
-  const cv::Mat & bgr_img, int w, int h, double scale)
+  const cv::Mat & bgr_img, int w, int h, double scale, int frame_count)
 {
   auto t0 = std::chrono::steady_clock::now();
 
@@ -364,44 +400,51 @@ YOLOV5::TrtInferResult YOLOV5::infer_tensorrt_gpu_preprocess(
     static_cast<float *>(trt_input_device_), w, h, static_cast<float>(scale), trt_stream_);
   auto t2 = std::chrono::steady_clock::now();
 
-  trt_nms_allocator_.reset_shape();
+  // Unlike the earlier DDS-based fusion (see git history), EfficientNMS_TRT's
+  // outputs are all FIXED shape, so enqueueV3() goes back to being a cheap
+  // dispatch call -- no per-frame blocking wait baked into it, and no need
+  // to know num_detections before deciding how much to copy back (always
+  // just kMaxNmsOutputBoxes worth, truncated to num_detections after the
+  // fact). t2b isolates exactly how long the enqueueV3() call itself takes,
+  // for direct comparison against the ~6.5ms it cost under the old DDS
+  // approach.
   if (!trt_context_->enqueueV3(trt_stream_)) {
     throw std::runtime_error("YOLOV5: TensorRT enqueueV3 failed");
   }
-  cudaStreamSynchronize(trt_stream_);
-  auto t3 = std::chrono::steady_clock::now();
-
-  // num_selected() is safe to read here: the preceding cudaStreamSynchronize
-  // waited for everything enqueued up to and including enqueueV3 (which per
-  // TensorRT's documented data-dependent-shape contract does not return
-  // until any DDS output's notifyShape() callback has already fired), so
-  // trt_nms_allocator_'s shape state is guaranteed known by this point.
-  int num_selected = trt_nms_allocator_.num_selected();
+  auto t2b = std::chrono::steady_clock::now();
 
   cudaMemcpyAsync(
     trt_output_host_, trt_output_device_, 1 * 25200 * 22 * sizeof(float), cudaMemcpyDeviceToHost,
     trt_stream_);
   cudaMemcpyAsync(
-    trt_selected_indices_host_, trt_nms_allocator_.device_buffer(), num_selected * 3 * sizeof(int64_t),
+    trt_num_detections_host_, trt_num_detections_device_, sizeof(int32_t), cudaMemcpyDeviceToHost,
+    trt_stream_);
+  cudaMemcpyAsync(
+    trt_detection_scores_host_, trt_detection_scores_device_, kMaxNmsOutputBoxes * sizeof(float),
     cudaMemcpyDeviceToHost, trt_stream_);
   cudaStreamSynchronize(trt_stream_);
-  auto t4 = std::chrono::steady_clock::now();
+  auto t3 = std::chrono::steady_clock::now();
+
+  int num_detections = std::min<int32_t>(trt_num_detections_host_[0], kMaxNmsOutputBoxes);
 
   auto ms = [](auto a, auto b) { return std::chrono::duration<double, std::milli>(b - a).count(); };
+  double memcpy_ms = ms(t0, t1), dispatch_ms = ms(t1, t2), enqueue_ms = ms(t2, t2b),
+         gpu_wait_d2h_ms = ms(t2b, t3);
   tools::logger()->info(
-    // "gpu_wait" = time waiting for the preprocessing kernel + TensorRT
-    // inference + fused NMS to actually finish executing on the GPU (all
-    // dispatched async at t2, so this bucket isn't purely "infer" anymore --
-    // the sync at t3 can't distinguish where GPU time went between them).
-    "[TRT-TIMING] memcpy={:.2f}ms dispatch={:.2f}ms gpu_wait={:.2f}ms d2h={:.2f}ms num_selected={}",
-    ms(t0, t1), ms(t1, t2), ms(t2, t3), ms(t3, t4), num_selected);
+    "[TRT-TIMING] memcpy={:.2f}ms dispatch={:.2f}ms enqueueV3={:.2f}ms gpu_wait_and_d2h={:.2f}ms "
+    "num_detections={}",
+    memcpy_ms, dispatch_ms, enqueue_ms, gpu_wait_d2h_ms, num_detections);
+  trt_memcpy_stats_.add(memcpy_ms, frame_count);
+  trt_dispatch_stats_.add(dispatch_ms, frame_count);
+  trt_enqueue_stats_.add(enqueue_ms, frame_count);
+  trt_gpu_wait_d2h_stats_.add(gpu_wait_d2h_ms, frame_count);
 
-  // clone()/copy: trt_output_host_/trt_selected_indices_host_ are
+  // clone()/copy: trt_output_host_/trt_detection_scores_host_ are
   // persistent buffers reused every call, so the caller needs its own copy,
   // not a view into them.
   return TrtInferResult{
-    cv::Mat(25200, 22, CV_32F, trt_output_host_).clone(),
-    std::vector<int64_t>(trt_selected_indices_host_, trt_selected_indices_host_ + num_selected * 3)};
+    cv::Mat(25200, 22, CV_32F, trt_output_host_).clone(), num_detections,
+    std::vector<float>(trt_detection_scores_host_, trt_detection_scores_host_ + num_detections)};
 }
 #endif
 
@@ -526,27 +569,52 @@ void YOLOV5::finalize_armors(std::list<Armor> & armors, const cv::Mat & bgr_img,
 }
 
 #ifdef HAVE_TENSORRT
-// TensorRT fused-NMS path: selected_indices' box_index column (index 2 of
-// each 3-int64 [batch_index, class_index, box_index] triple -- batch_index
-// and class_index are always 0, since NMS here runs over a single "class"
-// (objectness), see scripts/onnx/fuse_nms.py) directly indexes raw_output,
-// which is otherwise byte-identical to what parse() scans (the graph
-// surgery is purely additive). No cv::dnn::NMSBoxes call needed --
-// suppression already happened on the GPU. Confidence isn't part of NMS's
-// ONNX output (indices only), so it's recomputed here -- cheap, at most
-// kMaxNmsOutputBoxes sigmoid() calls versus parse()'s up to 25200.
-std::list<Armor> YOLOV5::parse_from_selected_indices(
-  double scale, const cv::Mat & raw_output, const int64_t * selected_indices, int num_selected,
+// TensorRT fused-NMS path: EfficientNMS_TRT's suppression already happened
+// on the GPU (see scripts/onnx/fuse_efficient_nms.py) and returns each
+// surviving detection's score, but -- unlike the earlier DDS-based fusion's
+// selected_indices, which returned the original row index directly -- not
+// which of the 25200 candidate rows in raw_output (otherwise byte-identical
+// to what parse() scans; the graph surgery is purely additive) it came
+// from. This model needs that row's actual 4 keypoints (not just an
+// axis-aligned box) for the armor-corner PnP solve, so recover the row by
+// matching against a single fresh pass of sigmoid(objectness) over all
+// rows -- nearest-match, not exact equality, because the plugin's internal
+// sigmoid (score_activation=true) isn't guaranteed bit-identical to this
+// host-side one; ties among 25200 continuous float scores are practically
+// impossible, so nearest-match is robust. Still cheap versus parse()'s full
+// scan: one sigmoid pass over all rows (no per-row argmax/keypoint work)
+// plus at most kMaxNmsOutputBoxes linear scans of that.
+std::list<Armor> YOLOV5::parse_from_efficient_nms(
+  double scale, const cv::Mat & raw_output, const float * detection_scores, int num_detections,
   const cv::Mat & bgr_img, int frame_count)
 {
   std::list<Armor> armors;
   const float fscale = static_cast<float>(scale);
 
-  for (int i = 0; i < num_selected; i++) {
-    int64_t box_idx = selected_indices[i * 3 + 2];
-    const float * row = raw_output.ptr<float>(static_cast<int>(box_idx));
+  if (num_detections == 0) {
+    finalize_armors(armors, bgr_img, frame_count);
+    return armors;
+  }
 
-    double score = sigmoid(row[8]);
+  std::vector<float> objectness(static_cast<size_t>(raw_output.rows));
+  for (int r = 0; r < raw_output.rows; r++) {
+    objectness[static_cast<size_t>(r)] = static_cast<float>(sigmoid(raw_output.ptr<float>(r)[8]));
+  }
+
+  for (int i = 0; i < num_detections; i++) {
+    float target = detection_scores[i];
+    int best_row = 0;
+    float best_diff = std::abs(objectness[0] - target);
+    for (int r = 1; r < raw_output.rows; r++) {
+      float diff = std::abs(objectness[static_cast<size_t>(r)] - target);
+      if (diff < best_diff) {
+        best_diff = diff;
+        best_row = r;
+      }
+    }
+
+    const float * row = raw_output.ptr<float>(best_row);
+    double score = objectness[static_cast<size_t>(best_row)];
 
     int _color_id = 0;
     float best_color = row[9];
@@ -596,11 +664,11 @@ std::list<Armor> YOLOV5::parse_from_selected_indices(
   return armors;
 }
 
-std::list<Armor> YOLOV5::postprocess_from_selected_indices(
-  double scale, cv::Mat & raw_output, const int64_t * selected_indices, int num_selected,
+std::list<Armor> YOLOV5::postprocess_from_efficient_nms(
+  double scale, cv::Mat & raw_output, const float * detection_scores, int num_detections,
   const cv::Mat & bgr_img, int frame_count)
 {
-  return parse_from_selected_indices(scale, raw_output, selected_indices, num_selected, bgr_img, frame_count);
+  return parse_from_efficient_nms(scale, raw_output, detection_scores, num_detections, bgr_img, frame_count);
 }
 #endif
 

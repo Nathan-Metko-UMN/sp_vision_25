@@ -34,38 +34,56 @@ void trt_build_or_load_engine(
   std::unique_ptr<nvinfer1::ICudaEngine> & engine, const std::string & onnx_path,
   const std::string & engine_path);
 
-// Names baked into the fused-NMS ONNX graph by scripts/onnx/fuse_nms.py --
-// kept as named constants (not string literals scattered across yolov5.cpp/
-// mt_detector.cpp) so there's exactly one place to update if that script's
-// output names ever change.
+// Names baked into the fused-NMS ONNX graph by
+// scripts/onnx/fuse_efficient_nms.py -- kept as named constants (not string
+// literals scattered across yolov5.cpp/mt_detector.cpp) so there's exactly
+// one place to update if that script's output names ever change.
+//
+// This uses TensorRT's own EfficientNMS_TRT plugin, not the ONNX-standard
+// NonMaxSuppression op an earlier version of this fusion used (see git
+// history for scripts/onnx/fuse_nms.py, superseded). That earlier approach
+// produced a dynamically-shaped `selected_indices` output, which forced
+// TensorRT's data-dependent-shape (DDS) machinery (IOutputAllocator) --
+// and TensorRT 10.0-10.7 (this Jetson is pinned to 10.3.0 via JetPack
+// 6.1/6.2, no in-place upgrade available) has a documented, NVIDIA-
+// acknowledged performance regression there: enqueueV3() blocks until the
+// whole network finishes instead of returning immediately, measured at
+// ~6.5ms (essentially the full GPU compute time) instead of near-instant.
+// EfficientNMS_TRT sidesteps this: its outputs are FIXED shape, padded to
+// kMaxNmsOutputBoxes, so no IOutputAllocator/DDS is needed at all.
 inline constexpr const char * kTrtOutputTensorName = "output/sink_port_0";
-inline constexpr const char * kTrtSelectedIndicesTensorName = "selected_indices";
+inline constexpr const char * kTrtNumDetectionsTensorName = "num_detections";
+inline constexpr const char * kTrtDetectionBoxesTensorName = "detection_boxes";
+inline constexpr const char * kTrtDetectionScoresTensorName = "detection_scores";
+inline constexpr const char * kTrtDetectionClassesTensorName = "detection_classes";
 
-// Must match max_output_boxes_per_class in scripts/onnx/fuse_nms.py exactly
-// -- this is the worst-case row count TrtNmsOutputAllocator
-// (trt_nms_allocator.hpp) pre-sizes its device buffer to, so that
-// reallocateOutputAsync() is expected to fire (i.e. actually allocate) at
-// most once ever, not once per frame. No compiler links these two
-// constants -- if you change one, change the other.
+// Must match max_output_boxes in scripts/onnx/fuse_efficient_nms.py exactly
+// -- this is the fixed row count detection_boxes/detection_scores/
+// detection_classes are padded to. No compiler links these two constants
+// -- if you change one, change the other.
 inline constexpr int64_t kMaxNmsOutputBoxes = 64;
 
 struct TrtIONames
 {
   std::string input;
-  std::string output;            // kTrtOutputTensorName -- 1x25200x22 float, static shape
-  std::string selected_indices;  // kTrtSelectedIndicesTensorName -- [-1,3] int64, data-dependent shape
+  std::string output;             // kTrtOutputTensorName -- 1x25200x22 float, static shape
+  std::string num_detections;     // kTrtNumDetectionsTensorName -- 1x1 int32, static shape
+  std::string detection_boxes;    // kTrtDetectionBoxesTensorName -- 1x64x4 float, static shape (unused downstream -- EfficientNMS_TRT requires an address bound for it regardless)
+  std::string detection_scores;   // kTrtDetectionScoresTensorName -- 1x64 float, static shape
+  std::string detection_classes;  // kTrtDetectionClassesTensorName -- 1x64 int32, static shape (unused downstream -- only ever one "class")
 };
 
 // Discovers I/O tensor names by IOMode + exact name match. Replaces the
 // naive "first kINPUT wins input, else output" loop this repo used before
-// the engine had two outputs -- that loop silently broke once a second
-// output existed (it just kept overwriting a single output-name variable
-// with whichever output getIOTensorName() enumerated last). No
-// backward-compat fallback for a pre-fusion single-output engine/onnx:
-// since assets/yolov5.onnx is permanently rewritten by fuse_nms.py going
-// forward, a stale local .engine (gitignored, cached from before that
-// change) or an accidentally-reverted .onnx should fail loudly here at
-// construction time, not silently degrade.
+// the engine had multiple outputs -- that loop silently broke once a
+// second output existed (it just kept overwriting a single output-name
+// variable with whichever output getIOTensorName() enumerated last). No
+// backward-compat fallback for a pre-fusion single-output engine/onnx or
+// the earlier DDS-based fusion (selected_indices): since assets/yolov5.onnx
+// is permanently rewritten by fuse_efficient_nms.py going forward, a stale
+// local .engine (gitignored, cached from before that change) or an
+// accidentally-reverted .onnx should fail loudly here at construction
+// time, not silently degrade.
 TrtIONames trt_discover_io_names(nvinfer1::ICudaEngine & engine);
 
 }  // namespace auto_aim

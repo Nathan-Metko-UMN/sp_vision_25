@@ -32,6 +32,12 @@ find_library(TENSORRT_NVINFER_LIB nvinfer
     PATHS /usr/lib/aarch64-linux-gnu /usr/lib/x86_64-linux-gnu /usr/lib)
 find_library(TENSORRT_NVONNXPARSER_LIB nvonnxparser
     PATHS /usr/lib/aarch64-linux-gnu /usr/lib/x86_64-linux-gnu /usr/lib)
+# initLibNvInferPlugins() (needed to register EfficientNMS_TRT -- see
+# scripts/onnx/fuse_efficient_nms.py -- with the plugin registry; trtexec
+# does this automatically at startup, this project's own use of the
+# TensorRT API doesn't) lives in libnvinfer_plugin, not libnvinfer.
+find_library(TENSORRT_NVINFER_PLUGIN_LIB nvinfer_plugin
+    PATHS /usr/lib/aarch64-linux-gnu /usr/lib/x86_64-linux-gnu /usr/lib)
 find_path(CUDA_INCLUDE_DIR cuda_runtime_api.h PATHS /usr/local/cuda/include)
 find_library(CUDA_CUDART_LIB cudart PATHS /usr/local/cuda/lib64 /usr/local/cuda/targets/aarch64-linux/lib /usr/local/cuda/targets/x86_64-linux/lib)
 
@@ -70,7 +76,6 @@ add_library(auto_aim OBJECT
     yolos/yolov8.cpp
     yolos/yolo11.cpp
     yolos/trt_engine.cpp
-    yolos/trt_nms_allocator.cpp
     multithread/commandgener.cpp
     multithread/mt_detector.cpp
     planner/planner.cpp
@@ -87,15 +92,16 @@ else()
     message(STATUS "onnxruntime not found at /opt/onnxruntime -- device: CUDA will not be available (OpenVINO CPU/GPU only)")
 endif()
 
-if(TENSORRT_INCLUDE_DIR AND TENSORRT_NVINFER_LIB AND TENSORRT_NVONNXPARSER_LIB AND CUDA_INCLUDE_DIR
-   AND CUDA_CUDART_LIB AND CMAKE_CUDA_COMPILER)
+if(TENSORRT_INCLUDE_DIR AND TENSORRT_NVINFER_LIB AND TENSORRT_NVONNXPARSER_LIB AND TENSORRT_NVINFER_PLUGIN_LIB
+   AND CUDA_INCLUDE_DIR AND CUDA_CUDART_LIB AND CMAKE_CUDA_COMPILER)
     message(STATUS "TensorRT + CUDA compiler found -- device: TENSORRT (NVIDIA GPU, GPU-side preprocessing) backend enabled for YOLOV5")
     target_compile_definitions(auto_aim PUBLIC HAVE_TENSORRT)
     target_include_directories(auto_aim PUBLIC ${TENSORRT_INCLUDE_DIR} ${CUDA_INCLUDE_DIR})
-    target_link_libraries(auto_aim ${TENSORRT_NVINFER_LIB} ${TENSORRT_NVONNXPARSER_LIB} ${CUDA_CUDART_LIB})
+    target_link_libraries(auto_aim ${TENSORRT_NVINFER_LIB} ${TENSORRT_NVONNXPARSER_LIB}
+        ${TENSORRT_NVINFER_PLUGIN_LIB} ${CUDA_CUDART_LIB})
     target_sources(auto_aim PRIVATE yolos/preprocess_kernel.cu)
-elseif(TENSORRT_INCLUDE_DIR AND TENSORRT_NVINFER_LIB AND TENSORRT_NVONNXPARSER_LIB AND CUDA_INCLUDE_DIR
-       AND CUDA_CUDART_LIB)
+elseif(TENSORRT_INCLUDE_DIR AND TENSORRT_NVINFER_LIB AND TENSORRT_NVONNXPARSER_LIB AND TENSORRT_NVINFER_PLUGIN_LIB
+       AND CUDA_INCLUDE_DIR AND CUDA_CUDART_LIB)
     message(STATUS "TensorRT found but no CUDA compiler (nvcc) -- device: TENSORRT will not be available (its preprocessing is a custom CUDA kernel, needs nvcc to build)")
 else()
     message(STATUS "TensorRT not found -- device: TENSORRT will not be available")

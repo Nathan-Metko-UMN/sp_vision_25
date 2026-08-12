@@ -21,12 +21,12 @@
 
 #include "tasks/auto_aim/yolos/preprocess_kernel.hpp"
 #include "tasks/auto_aim/yolos/trt_engine.hpp"
-#include "tasks/auto_aim/yolos/trt_nms_allocator.hpp"
 #endif
 
 #include "tasks/auto_aim/armor.hpp"
 #include "tasks/auto_aim/detector.hpp"
 #include "tasks/auto_aim/yolo.hpp"
+#include "tools/stats.hpp"
 
 namespace auto_aim
 {
@@ -43,14 +43,20 @@ public:
 
 #ifdef HAVE_TENSORRT
   // For device: TENSORRT's fused-NMS engine (see trt_engine.hpp/
-  // scripts/onnx/fuse_nms.py): NMS suppression already happened on the GPU,
-  // selected_indices' box_index column gathers the surviving rows directly
-  // out of raw_output. Used by MultiThreadDetector (async path) instead of
-  // postprocess() -- see YOLOBase::postprocess_from_selected_indices for
-  // why this is a virtual method with a default-throwing body rather than
-  // pure virtual (YOLOV8/YOLO11 never support it).
-  std::list<Armor> postprocess_from_selected_indices(
-    double scale, cv::Mat & raw_output, const int64_t * selected_indices, int num_selected,
+  // scripts/onnx/fuse_efficient_nms.py): NMS suppression already happened
+  // on the GPU via TensorRT's EfficientNMS_TRT plugin, which returns fixed-
+  // shape (padded to kMaxNmsOutputBoxes) detection_scores -- the original
+  // row each surviving detection came from is recovered by matching that
+  // score against raw_output's objectness column (see
+  // parse_from_efficient_nms in yolov5.cpp for why: this model needs the
+  // matched row's 4 keypoints, not just an axis-aligned box, for the armor-
+  // corner PnP solve, and EfficientNMS_TRT doesn't return the original row
+  // index). Used by MultiThreadDetector (async path) instead of
+  // postprocess() -- see YOLOBase::postprocess_from_efficient_nms for why
+  // this is a virtual method with a default-throwing body rather than pure
+  // virtual (YOLOV8/YOLO11 never support it).
+  std::list<Armor> postprocess_from_efficient_nms(
+    double scale, cv::Mat & raw_output, const float * detection_scores, int num_detections,
     const cv::Mat & bgr_img, int frame_count) override;
 #endif
 
@@ -105,29 +111,55 @@ private:
   uint8_t * trt_raw_input_host_ = nullptr;  // pinned
   int trt_raw_w_ = -1, trt_raw_h_ = -1;
 
-  // Fused-NMS engine's second output (see trt_engine.hpp/
-  // scripts/onnx/fuse_nms.py): selected_indices, a data-dependent-shape
-  // (DDS) tensor of [batch_index, class_index, box_index] triples for
-  // whichever of the 25200 candidate rows survived GPU-side NMS.
-  // trt_nms_allocator_ is the IOutputAllocator TensorRT requires for any
-  // DDS output (context->getTensorShape() post-enqueue doesn't report a
-  // DDS output's real shape); trt_selected_indices_host_ is the pinned
-  // host-side readback buffer, sized to the worst case (kMaxNmsOutputBoxes).
-  std::string trt_selected_indices_name_;
-  TrtNmsOutputAllocator trt_nms_allocator_;
-  int64_t * trt_selected_indices_host_ = nullptr;  // pinned, kMaxNmsOutputBoxes*3 int64
+  // Fused-NMS engine's extra outputs (see trt_engine.hpp/
+  // scripts/onnx/fuse_efficient_nms.py): all FIXED shape (padded to
+  // kMaxNmsOutputBoxes), so -- unlike the earlier DDS-based fusion this
+  // replaced -- no IOutputAllocator is needed, just plain device buffers
+  // and setTensorAddress() like input/output already use.
+  // detection_boxes/detection_classes are bound (TensorRT requires every
+  // output tensor to have an address) but never read back to host: we
+  // don't use EfficientNMS_TRT's box (recomputed from keypoints instead)
+  // or class (always 0, single "class" = objectness) outputs.
+  void * trt_num_detections_device_ = nullptr;
+  void * trt_detection_boxes_device_ = nullptr;
+  void * trt_detection_scores_device_ = nullptr;
+  void * trt_detection_classes_device_ = nullptr;
+  int32_t * trt_num_detections_host_ = nullptr;   // pinned, 1 int32
+  float * trt_detection_scores_host_ = nullptr;   // pinned, kMaxNmsOutputBoxes float
 
   struct TrtInferResult
   {
-    cv::Mat raw_output;                     // 25200x22, cloned (unchanged from before fusion)
-    std::vector<int64_t> selected_indices;  // num_selected*3 int64 triples
+    cv::Mat raw_output;  // 25200x22, cloned (unchanged from before fusion)
+    int num_detections;
+    std::vector<float> detection_scores;  // num_detections valid entries (of kMaxNmsOutputBoxes)
   };
-  TrtInferResult infer_tensorrt_gpu_preprocess(const cv::Mat & bgr_img, int w, int h, double scale);
+  TrtInferResult infer_tensorrt_gpu_preprocess(
+    const cv::Mat & bgr_img, int w, int h, double scale, int frame_count);
 
-  std::list<Armor> parse_from_selected_indices(
-    double scale, const cv::Mat & raw_output, const int64_t * selected_indices, int num_selected,
+  std::list<Armor> parse_from_efficient_nms(
+    double scale, const cv::Mat & raw_output, const float * detection_scores, int num_detections,
     const cv::Mat & bgr_img, int frame_count);
+
+  // Per-bracket running mean/stddev/min/max + worst-N outlier frames for
+  // the [TRT-TIMING]/[PARSE-TIMING] numbers below -- these vary noticeably
+  // frame to frame (thermal throttling, OS scheduling jitter, occasional
+  // slow video-decode frames), and eyeballing individual log lines doesn't
+  // answer "how much" or "which frames". Auto-logs a [STATS] summary every
+  // 200 frames and once more at destruction.
+  tools::Stats trt_memcpy_stats_{"TRT memcpy"};
+  tools::Stats trt_dispatch_stats_{"TRT dispatch"};
+  tools::Stats trt_enqueue_stats_{"TRT enqueueV3"};
+  tools::Stats trt_gpu_wait_d2h_stats_{"TRT gpu_wait_and_d2h"};
 #endif
+  tools::Stats parse_stats_{"parse"};
+  // Wraps the ENTIRE detect() call (both TensorRT and OpenVINO/CUDA
+  // backends) -- this is the number that actually dictates achievable FPS
+  // in the single-threaded path (1000/mean = sustainable ceiling); the
+  // per-bracket stats above are its components, not a substitute for it
+  // (they don't cover ROI/scale setup, and for the non-TensorRT path,
+  // detect() also has the [LETTERBOX-TIMING] cost this doesn't separately
+  // track as a Stats object).
+  tools::Stats detect_total_stats_{"detect total"};
 
   cv::Mat infer_openvino(const cv::Mat & input);
 
@@ -153,7 +185,7 @@ private:
 
   std::list<Armor> parse(double scale, cv::Mat & output, const cv::Mat & bgr_img, int frame_count);
 
-  // Shared tail of parse() and (TensorRT-only) parse_from_selected_indices():
+  // Shared tail of parse() and (TensorRT-only) parse_from_efficient_nms():
   // name/type filtering, optional traditional-CV keypoint refinement,
   // center_norm, and debug drawing -- backend-independent per-detection
   // postprocessing that must behave identically regardless of which path

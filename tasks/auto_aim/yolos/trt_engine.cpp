@@ -1,6 +1,7 @@
 #include "trt_engine.hpp"
 
 #ifdef HAVE_TENSORRT
+#include <NvInferPlugin.h>
 #include <NvOnnxParser.h>
 
 #include <fstream>
@@ -23,6 +24,20 @@ void trt_build_or_load_engine(
   std::unique_ptr<nvinfer1::ICudaEngine> & engine, const std::string & onnx_path,
   const std::string & engine_path)
 {
+  // Registers TensorRT's built-in plugin creators (including
+  // EfficientNMS_TRT, used by the fused-NMS graph -- see
+  // scripts/onnx/fuse_efficient_nms.py) with the global plugin registry.
+  // trtexec calls this automatically at startup, which is why a graph that
+  // parses/builds/runs fine under trtexec can still fail here ("Plugin not
+  // found, are the plugin name, version, and namespace correct?") without
+  // it -- needed both for parsing the .onnx (builder path) and for
+  // deserializing a cached .engine (its plugin layers look the creator up
+  // by name too), so this must run before either path below, not just the
+  // build path.
+  if (!initLibNvInferPlugins(&logger, "")) {
+    throw std::runtime_error("TensorRT: initLibNvInferPlugins failed");
+  }
+
   runtime.reset(nvinfer1::createInferRuntime(logger));
   if (!runtime) throw std::runtime_error("TensorRT: failed to create runtime");
 
@@ -96,18 +111,30 @@ TrtIONames trt_discover_io_names(nvinfer1::ICudaEngine & engine)
       names.input = name;
     } else if (name == kTrtOutputTensorName) {
       names.output = name;
-    } else if (name == kTrtSelectedIndicesTensorName) {
-      names.selected_indices = name;
+    } else if (name == kTrtNumDetectionsTensorName) {
+      names.num_detections = name;
+    } else if (name == kTrtDetectionBoxesTensorName) {
+      names.detection_boxes = name;
+    } else if (name == kTrtDetectionScoresTensorName) {
+      names.detection_scores = name;
+    } else if (name == kTrtDetectionClassesTensorName) {
+      names.detection_classes = name;
     } else {
       throw std::runtime_error("TensorRT: engine has unexpected I/O tensor '" + name + "'");
     }
   }
-  if (names.input.empty() || names.output.empty() || names.selected_indices.empty()) {
+  if (
+    names.input.empty() || names.output.empty() || names.num_detections.empty() ||
+    names.detection_boxes.empty() || names.detection_scores.empty() ||
+    names.detection_classes.empty()) {
     throw std::runtime_error(
       "TensorRT: engine I/O tensors don't match the expected fused-NMS layout (found input='" +
-      names.input + "' output='" + names.output + "' selected_indices='" + names.selected_indices +
-      "' -- likely a stale .engine cached from before NMS fusion, or an unfused .onnx; "
-      "delete the local .engine and/or re-run scripts/onnx/fuse_nms.py)");
+      names.input + "' output='" + names.output + "' num_detections='" + names.num_detections +
+      "' detection_boxes='" + names.detection_boxes + "' detection_scores='" + names.detection_scores +
+      "' detection_classes='" + names.detection_classes +
+      "' -- likely a stale .engine cached from before this fusion (or from the earlier DDS-based "
+      "fusion), or an unfused .onnx; delete the local .engine and/or re-run "
+      "scripts/onnx/fuse_efficient_nms.py)");
   }
   return names;
 }

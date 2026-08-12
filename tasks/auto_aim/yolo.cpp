@@ -41,12 +41,12 @@ std::list<Armor> YOLO::postprocess(
   return yolo_->postprocess(scale, output, bgr_img, frame_count);
 }
 
-std::list<Armor> YOLO::postprocess_from_selected_indices(
-  double scale, cv::Mat & raw_output, const int64_t * selected_indices, int num_selected,
+std::list<Armor> YOLO::postprocess_from_efficient_nms(
+  double scale, cv::Mat & raw_output, const float * detection_scores, int num_detections,
   const cv::Mat & bgr_img, int frame_count)
 {
-  return yolo_->postprocess_from_selected_indices(
-    scale, raw_output, selected_indices, num_selected, bgr_img, frame_count);
+  return yolo_->postprocess_from_efficient_nms(
+    scale, raw_output, detection_scores, num_detections, bgr_img, frame_count);
 }
 
 }  // namespace auto_aim

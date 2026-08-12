@@ -18,11 +18,11 @@
 
 #include "tasks/auto_aim/yolos/preprocess_kernel.hpp"
 #include "tasks/auto_aim/yolos/trt_engine.hpp"
-#include "tasks/auto_aim/yolos/trt_nms_allocator.hpp"
 #endif
 
 #include "tasks/auto_aim/yolos/yolov5.hpp"
 #include "tools/logger.hpp"
+#include "tools/stats.hpp"
 #include "tools/thread_safe_queue.hpp"
 
 namespace auto_aim
@@ -87,7 +87,9 @@ private:
   // mt_standard.cpp), so there's no cross-thread race on the context.
   std::unique_ptr<nvinfer1::IExecutionContext> trt_context_;
   cudaStream_t trt_stream_ = nullptr;
-  std::string trt_input_name_, trt_output_name_, trt_selected_indices_name_;
+  std::string trt_input_name_, trt_output_name_;
+  std::string trt_num_detections_name_, trt_detection_boxes_name_, trt_detection_scores_name_,
+    trt_detection_classes_name_;
 
   struct TrtSlot
   {
@@ -107,14 +109,20 @@ private:
     // share), but keeping it per-slot too avoids the asymmetry.
     void * raw_input_device = nullptr;
     uint8_t * raw_input_host = nullptr;  // pinned
-    // Fused-NMS engine's second output (see trt_engine.hpp/
-    // scripts/onnx/fuse_nms.py) -- own IOutputAllocator instance per slot,
-    // same reasoning as the other per-slot buffers above: context->
-    // setOutputAllocator() is re-pointed to this slot's instance
-    // immediately before this slot's enqueueV3(), mirroring how
-    // setTensorAddress() is already re-pointed per-slot.
-    TrtNmsOutputAllocator nms_allocator;
-    int64_t * selected_indices_host = nullptr;  // pinned, kMaxNmsOutputBoxes*3 int64
+    // Fused-NMS engine's extra outputs (see trt_engine.hpp/
+    // scripts/onnx/fuse_efficient_nms.py) -- all FIXED shape (padded to
+    // kMaxNmsOutputBoxes), so -- unlike the earlier DDS-based fusion this
+    // replaced -- these are plain per-slot device buffers + setTensorAddress
+    // like input/output already use, no IOutputAllocator needed.
+    // detection_boxes/detection_classes are bound (every output tensor
+    // needs an address) but never read back to host -- see the equivalent
+    // comment in yolov5.hpp for why.
+    void * num_detections_device = nullptr;
+    void * detection_boxes_device = nullptr;
+    void * detection_scores_device = nullptr;
+    void * detection_classes_device = nullptr;
+    int32_t * num_detections_host = nullptr;  // pinned, 1 int32
+    float * detection_scores_host = nullptr;  // pinned, kMaxNmsOutputBoxes float
     cudaEvent_t d2h_done = nullptr;
     // True from the moment push_tensorrt() dispatches this slot's GPU work
     // until pop_tensorrt() has *fully read* its result (not merely until
@@ -144,19 +152,52 @@ private:
   // changes (never, in practice, for a fixed camera/ROI).
   int trt_raw_w_ = -1, trt_raw_h_ = -1;
 
-  // {img.clone(), t, slot_index, letterbox_scale, num_selected} -- FIFO
+  // {img.clone(), t, slot_index, letterbox_scale, push_frame_index} -- FIFO
   // order matches slot-reuse order (the ring is strictly round-robin), so
-  // no separate slot->queue-entry lookup is needed. num_selected is
-  // captured once in push_tensorrt() right after enqueueV3() and threaded
-  // through here rather than re-read from the slot's nms_allocator a
-  // second time in pop_tensorrt() -- avoids two logically-separate reads of
-  // the same allocator state ever disagreeing.
+  // no separate slot->queue-entry lookup is needed. Unlike the earlier
+  // DDS-based fusion (where the survivor count was known the instant
+  // enqueueV3() returned, via TensorRT's notifyShape() callback),
+  // num_detections here is regular device data behind an async D2H copy --
+  // not known until pop_tensorrt() waits on slot.d2h_done, so it's read
+  // from the slot's pinned host buffer there instead of being threaded
+  // through this queue. push_frame_index is a simple monotonic counter
+  // (not the caller's actual frame_count -- push()/push_tensorrt() are
+  // never given one), threaded through purely so the tools::Stats worst-N
+  // outlier lists below can say *which* push/pop call was slow, not just
+  // that some was.
   tools::ThreadSafeQueue<
     std::tuple<cv::Mat, std::chrono::steady_clock::time_point, int, double, int>>
     trt_queue_{16, [] { tools::logger()->debug("[MultiThreadDetector] TRT queue is full!"); }};
 
   void push_tensorrt(cv::Mat & img, std::chrono::steady_clock::time_point t);
   std::tuple<cv::Mat, std::chrono::steady_clock::time_point, std::list<Armor>> pop_tensorrt();
+
+  // Per-bracket running mean/stddev/min/max + worst-N outlier frames for
+  // the [MT-TRT-TIMING]/pipeline_latency numbers -- see the equivalent
+  // tools::Stats members in yolov5.hpp for why (frame-to-frame variance is
+  // real and worth quantifying, not just eyeballing individual log lines).
+  tools::Stats trt_push_memcpy_stats_{"MT push memcpy"};
+  tools::Stats trt_push_dispatch_stats_{"MT push dispatch"};
+  tools::Stats trt_push_enqueue_stats_{"MT push enqueueV3"};
+  // push total / pop total isolate each side's own ACTIVE cost -- push
+  // total deliberately starts AFTER push_tensorrt()'s backpressure wait
+  // (blocking for a free ring slot), so together with pop total these are
+  // for diagnosing WHICH STAGE is doing the work, not for reading off
+  // real-world achievable FPS directly (see [MT-THROUGHPUT] below, which is
+  // a theoretical ceiling assuming infinite buffering -- it doesn't see
+  // backpressure stalls or consumer-side imshow/waitKey cost either).
+  // trt_push_wall_stats_ is the one that DOES answer "what FPS am I really
+  // getting": it wraps the ENTIRE push() call, backpressure wait included
+  // -- exactly what a caller (e.g. mt_standard.cpp's producer loop) actually
+  // pays per frame, and because of that backpressure coupling it converges
+  // to reflect whichever side is truly the bottleneck once the pipeline
+  // reaches steady state, consumer-side cost included.
+  tools::Stats trt_push_total_stats_{"MT push total (excl. backpressure)"};
+  tools::Stats trt_push_wall_stats_{"MT push wall (incl. backpressure)"};
+  tools::Stats trt_pop_total_stats_{"MT pop total"};
+  tools::Stats trt_pipeline_latency_stats_{"MT pipeline_latency"};
+  int trt_pop_count_ = 0;      // gates a periodic throughput-ceiling log, see pop_tensorrt()
+  int trt_push_counter_ = 0;   // monotonic, see the trt_queue_ comment above
 #endif
 };
 
