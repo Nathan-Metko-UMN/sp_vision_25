@@ -1,4 +1,5 @@
 *.engine
+/patterns
 .vscode/
 .github/
 build/
