@@ -1,5 +1,6 @@
 #include <fmt/core.h>
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <opencv2/opencv.hpp>
@@ -35,6 +36,12 @@ const std::string keys =
   "{help h usage ? |                            | 输出命令行参数说明 }"
   "{config-path c  | configs/demo_tensorrt.yaml | yaml配置文件的路径}"
   "{sync           |                            | 使用单线程YOLO::detect()而不是异步流水线，用于对比}"
+  "{realtime       |                            | "
+  "按视频原始帧率节流显示（用于观看），而不是尽快压测流水线}"
+  "{headless       |                            | "
+  "完全不使用GUI（无imshow/waitKey，不需要任何X服务器），用于纯SSH压测}"
+  "{max-frames     | 0                          | "
+  "限制预加载帧数（0=不限制），用于减少内存占用}"
   "{@video_path    | assets/demo/demo.avi       | avi路径}";
 
 int main(int argc, char * argv[])
@@ -47,6 +54,9 @@ int main(int argc, char * argv[])
   auto video_path = cli.get<std::string>(0);
   auto config_path = cli.get<std::string>("config-path");
   bool sync_mode = cli.has("sync");
+  bool realtime_mode = cli.has("realtime");
+  bool headless_mode = cli.has("headless");
+  int max_frames = cli.get<int>("max-frames");
 
   tools::Exiter exiter;
 
@@ -55,10 +65,27 @@ int main(int argc, char * argv[])
     tools::logger()->error("failed to open {}", video_path);
     return 1;
   }
+  // CAP_PROP_FPS reflects the source file's own recorded rate -- not
+  // something to assume is 30/60, and some containers/codecs don't report
+  // it at all (property reads back <= 0), hence the fallback. Only used
+  // to pace the consumer's imshow display under --realtime below; the
+  // producer thread (push()) and every timed metric are untouched by this
+  // either way.
+  double video_fps = video.get(cv::CAP_PROP_FPS);
+  if (video_fps <= 0) video_fps = 30.0;
+  int realtime_wait_ms = std::max(1, static_cast<int>(1000.0 / video_fps));
+  tools::logger()->info(
+    "mode: {} (video_fps={:.1f}){}", realtime_mode ? fmt::format("realtime, display paced to "
+                                                                   "~{}ms/frame", realtime_wait_ms)
+                                                     : "unthrottled (stress-test)",
+    video_fps, headless_mode ? " [headless: no imshow/waitKey, no X server needed]" : "");
 
   std::vector<cv::Mat> frames;
   auto decode_start = std::chrono::steady_clock::now();
-  for (cv::Mat frame; video.read(frame) && !frame.empty();) frames.push_back(frame.clone());
+  for (cv::Mat frame; video.read(frame) && !frame.empty();) {
+    frames.push_back(frame.clone());
+    if (max_frames > 0 && static_cast<int>(frames.size()) >= max_frames) break;
+  }
   auto decode_elapsed =
     std::chrono::duration<double>(std::chrono::steady_clock::now() - decode_start).count();
   tools::logger()->info(
@@ -72,7 +99,7 @@ int main(int argc, char * argv[])
     // no threading/queueing/ring-buffer involved at all -- isolates the
     // synchronous per-frame cost this async pipeline is being compared
     // against.
-    auto_aim::YOLO yolo(config_path, true);
+    auto_aim::YOLO yolo(config_path, !headless_mode);
     int total_armors = 0;
     auto start = std::chrono::steady_clock::now();
     for (size_t i = 0; i < frames.size() && !exiter.exit(); i++) {
@@ -90,7 +117,7 @@ int main(int argc, char * argv[])
     return 0;
   }
 
-  auto_aim::multithread::MultiThreadDetector detector(config_path, true);
+  auto_aim::multithread::MultiThreadDetector detector(config_path, !headless_mode);
 
   std::atomic<bool> producer_done{false};
   std::atomic<int> pushed_count{0};
@@ -139,10 +166,26 @@ int main(int argc, char * argv[])
       "[pop {}] armors={} pipeline_latency={:.1f}ms", popped_count, armors.size(),
       tools::delta_time(std::chrono::steady_clock::now(), t) * 1e3);
 
-    cv::resize(img, img, {}, 0.5, 0.5);
-    for (auto & armor : armors) tools::draw_points(img, armor.points, {0, 255, 0});
-    cv::imshow("mt_detector_video_test", img);
-    if (cv::waitKey(1) == 'q') break;
+    // No local imshow here -- removed (was drawing bounding boxes at the
+    // wrong location; the internal YOLOV5 debug window, controlled by the
+    // debug=!headless_mode constructor arg above, is the real visualization
+    // now). --headless skips waitKey() entirely -- it's what pumps GTK's event
+    // loop for the internal YOLOV5 debug window (see the debug=!headless_
+    // mode constructor arg above), and calling it with no window open (or
+    // no X server reachable at all) is exactly what --headless is for
+    // avoiding. tools::Exiter's Ctrl+C handling is a SIGINT handler, not a
+    // GUI keypress, so it still works fine without this call.
+    //
+    // --realtime paces the DISPLAY only (matching detector_video_test.cpp's
+    // waitKey(33)/auto_aim_test.cpp's waitKey(30) convention, computed here
+    // from the source video's own fps instead of a hardcoded guess) --
+    // push_tensorrt() on the producer thread is never slowed by this. With
+    // only kTrtRingSize=3 slots of buffering, though, a consumer paced to
+    // real-time WILL eventually throttle the producer too once that
+    // headroom is used up (via push_tensorrt()'s backpressure wait) --
+    // that's expected, not a bug: default (no flag) stays fully unthrottled
+    // for stress-testing/throughput measurement, same as before.
+    if (!headless_mode && cv::waitKey(realtime_mode ? realtime_wait_ms : 1) == 'q') break;
   }
 
   auto elapsed = std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();

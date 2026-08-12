@@ -200,6 +200,19 @@ run` command by hand — see the script's own header comment for what each
 piece does and why (in particular, why it uses a mounted `.Xauthority`
 instead of `xhost`).
 
+**For a pure-SSH session with no display at all** (no monitor, no Xvfb, not
+even a logged-in desktop) — `./docker_enter_jetson.sh --headless` skips the
+`$DISPLAY`/`.Xauthority` checks/warnings entirely, and when creating a
+*fresh* container, skips wiring up X11 (env vars + `.Xauthority`/
+`/tmp/.X11-unix` mounts) at all — you get a plain interactive shell in the
+container, ready to build and run the `--headless`-capable test binaries
+(§6.2/§6.4) with zero X11 dependency. A container created this way can't
+show `cv::imshow` windows later without being recreated via a normal
+(non-`--headless`) run of the script from a session that does have a
+working display — see §6.5 for a lighter one-off alternative if the
+container was already created with the X11 mounts from an earlier
+non-headless run.
+
 ### 5.3 Adding ROS 2 / sentry support (optional)
 
 This repo's sentry executables require a `sp_msgs` ROS2 package that isn't
@@ -504,58 +517,295 @@ HWC→CHW, running on the GPU (measured sitting at 15-30% average utilization
 otherwise -- plenty of idle headroom). Cut single-threaded `detect()` from
 ~11.6ms to ~6.7ms.
 
-**Fused NMS** (`tasks/auto_aim/yolos/trt_engine.hpp`, `trt_nms_allocator.hpp/
-.cpp`, `scripts/onnx/fuse_nms.py`): NMS suppression itself now runs inside
-the TensorRT engine via an ONNX `NonMaxSuppression` node, instead of a
-25200-row CPU scan (`YOLOV5::parse()`) every frame. `assets/yolov5.onnx` was
-modified in place by `scripts/onnx/fuse_nms.py` -- purely additive: the
-original `output/sink_port_0` output ([1,25200,22]) is untouched, a second
-output `selected_indices` ([-1,3] int64, `[batch_index, class_index,
-box_index]` triples) is added. C++ gathers the handful (0-64) of surviving
-rows directly from the unmodified original output using
-`selected_indices`' box_index column -- no `cv::dnn::NMSBoxes` call needed
-for the TensorRT path anymore (`YOLOV5::parse_from_selected_indices()`).
+**Fused NMS** (`tasks/auto_aim/yolos/trt_engine.hpp`,
+`scripts/onnx/fuse_efficient_nms.py`): NMS suppression itself now runs
+inside the TensorRT engine via NVIDIA's own `EfficientNMS_TRT` plugin,
+instead of a 25200-row CPU scan (`YOLOV5::parse()`) every frame.
+`assets/yolov5.onnx` was modified in place by
+`scripts/onnx/fuse_efficient_nms.py` -- purely additive: the original
+`output/sink_port_0` output ([1,25200,22]) is untouched, four more outputs
+are added (`num_detections` [1,1] int32, `detection_boxes` [1,64,4],
+`detection_scores` [1,64], `detection_classes` [1,64] -- all FIXED shape,
+padded to `kMaxNmsOutputBoxes`). C++ recovers which of the 25200 original
+rows each surviving detection came from by matching `detection_scores`
+against the original output's own objectness column (nearest-match, not
+exact equality -- the plugin's internal sigmoid isn't guaranteed
+bit-identical to the host-side one), then reads that row's keypoints/color/
+class directly -- no `cv::dnn::NMSBoxes` call needed for the TensorRT path
+anymore (`YOLOV5::parse_from_efficient_nms()`).
 
-**Why this needed more than just adding an output to the graph:**
-`selected_indices` has a *data-dependent shape* (DDS) -- its row count is
-only known once NMS actually executes, not from input shapes. TensorRT does
-**not** report this via `context->getTensorShape()` after
-`enqueueV3()`+sync (that returns -1 for a DDS output); it instead requires
-implementing `nvinfer1::IOutputAllocator` (`trt_nms_allocator.hpp`):
-`reallocateOutputAsync()` hands back a pre-sized device buffer,
-`notifyShape()` reports the real resulting shape once known, both
-registered via `context->setOutputAllocator(...)`. `MultiThreadDetector`'s
-ring-buffered async path needs one allocator instance *per slot* (not
-shared), re-pointed via `setOutputAllocator()` immediately before each
-slot's `enqueueV3()` call -- the same "re-point immediately before enqueue"
-pattern already used for `setTensorAddress()` on that shared context.
+**This supersedes an earlier attempt using the ONNX-standard
+`NonMaxSuppression` op** (`scripts/onnx/fuse_nms.py`, `git log` history --
+the script is no longer used but left in the repo for reference/rollback).
+That approach produced a dynamically-shaped `selected_indices` output,
+which forced TensorRT's data-dependent-shape (DDS) machinery
+(`nvinfer1::IOutputAllocator`) -- and measurement after full production
+integration found `enqueueV3()` became a genuinely blocking call under it
+(~6.5ms, essentially the full GPU compute time, instead of near-instant),
+which ate most of the intended win and regressed the async ring buffer's
+throughput (140.6fps -> 117.3fps). Root cause, confirmed via the TensorRT
+changelog: **TensorRT 10.0-10.7 has a documented, NVIDIA-acknowledged
+performance regression for DDS networks** ("Fixed performance regression
+for TensorRT 10.x compared to TensorRT 8.6 for networks involving
+data-dependent shapes (for example, non-max suppression or non-zero
+operations)" -- 10.8.0 release notes). This Jetson is pinned to TensorRT
+10.3.0 via JetPack 6.1/6.2 (both ship 10.3; no in-place upgrade carries the
+fix -- only JetPack 7.2, TensorRT 10.16.2, which is a full L4T major-version
+reflash, not attempted here). `EfficientNMS_TRT`'s fixed-shape outputs
+sidestep DDS entirely rather than waiting on that fix, at the cost of the
+row-recovery step described above (EfficientNMS_TRT doesn't return the
+original row index, only derived box/score/class, and this model needs the
+original row's actual keypoints -- not just an axis-aligned box -- for the
+armor-corner PnP solve).
 
 **If `assets/yolov5.onnx` is ever regenerated** (e.g. a retrained model
 re-exported via `openvino2onnx`, see §5.5/§5.6 above for that tool), re-run
-`python scripts/onnx/fuse_nms.py` afterward to re-apply the NMS fusion (it
-refuses to run on an already-fused graph -- start from a fresh
-`openvino2onnx` export), and delete any local `assets/yolov5.engine` so it
-gets rebuilt from the newly-fused onnx (`trt_build_or_load_engine()` has no
-staleness check against the `.onnx` it was built from -- it'll happily load
-a stale cached engine with the old I/O layout, which then fails loudly with
-an "unexpected fused-NMS layout" error at construction, not silently).
-`scripts/onnx/requirements.txt` pins the exact `onnx`/`onnx_graphsurgeon`
-versions validated against this graph's specific op mix -- other versions
-were found to break during development (missing/renamed internal APIs).
+`python scripts/onnx/fuse_efficient_nms.py` afterward to re-apply the NMS
+fusion (it refuses to run on an already-fused graph -- start from a fresh
+`openvino2onnx` export, or `scripts/onnx/yolov5_prefusion_backup.onnx`, a
+clean pre-fusion copy checked in for exactly this), and delete any local
+`assets/yolov5.engine` so it gets rebuilt from the newly-fused onnx
+(`trt_build_or_load_engine()` has no staleness check against the `.onnx` it
+was built from -- it'll happily load a stale cached engine with the old I/O
+layout, which then fails loudly with an "unexpected fused-NMS layout" error
+at construction, not silently). `scripts/onnx/requirements.txt` pins the
+exact `onnx`/`onnx_graphsurgeon` versions validated against this graph's
+specific op mix -- other versions were found to break during development
+(missing/renamed internal APIs).
 
 **Measured impact:** GPU compute time for detection + NMS combined averages
-~4.0ms (NMS itself adds under 0.5ms on top of plain inference) -- CPU-side
-`[PARSE-TIMING]` for the TensorRT path dropped from ~1.4-1.8ms (25200-row
-scan) to near-zero (0-64 rows). One open question flagged during design and
-worth re-checking after any TensorRT/JetPack upgrade: TensorRT's documented
-DDS contract implies `enqueueV3()` may not return until the fused NMS kernel
-has actually finished executing (not merely been dispatched), which could
-reduce how much the async ring buffer's cross-frame overlap helps
-specifically (see the `enqueueV3=` timing bucket added to `[MT-TRT-TIMING]`
-in `push_tensorrt()` -- included specifically to make this directly
-observable rather than something to infer).
+~3.7ms (`EfficientNMS_TRT` itself costs ~0.45ms on top of plain inference,
+confirmed via `trtexec --dumpProfile`; no DDS sync barriers appear in the
+per-layer profile, unlike the earlier approach) -- essentially the same
+total as with no NMS fusion at all. CPU-side `[PARSE-TIMING]` for the
+TensorRT path dropped from ~1.4-1.8ms (25200-row scan) to a single cheap
+sigmoid pass plus at most `kMaxNmsOutputBoxes` linear score-matching scans.
 
-## 6. Known gaps / things to verify on real hardware
+**Gotcha: `EfficientNMS_TRT` (and any other TensorRT plugin) needs
+`initLibNvInferPlugins()` called before it can be parsed OR deserialized.**
+`trtexec` does this automatically at startup, so a graph that parses/builds/
+runs fine under `trtexec` can still fail under this project's own use of the
+TensorRT API with `IPluginRegistry::getPluginCreator: ... Cannot find
+plugin: EfficientNMS_TRT` / `Cannot deserialize plugin since corresponding
+IPluginCreator not found`. Fixed in `trt_build_or_load_engine()`
+(`trt_engine.cpp`) -- one `initLibNvInferPlugins(&logger, "")` call before
+either the cached-engine-load or fresh-build path (needed for both: a
+cached `.engine`'s plugin layers look the creator up by name at
+deserialize time too, not just at parse time). Needs linking
+`libnvinfer_plugin` (`CMakeLists.txt`'s `TENSORRT_NVINFER_PLUGIN_LIB`),
+separate from `libnvinfer` itself.
+
+## 6. Testing and benchmarking on the Jetson
+
+Get an interactive shell in the dev container first, if you don't have one
+already: `./docker_enter_jetson.sh` (needs a working display -- see §5.2)
+or, for a plain SSH session with no display of any kind,
+`./docker_enter_jetson.sh --headless` (§5.2) -- everything below assumes
+you're running from inside the container, at the repo root
+(`/root/sp_vision_25`).
+
+### 6.1 Test binaries at a glance
+
+All three video-test binaries below now take a **`--headless`** flag
+(added this session): skips all `imshow`/`waitKey`, and passes
+`debug=false` down so even the internal `YOLOV5`/`Detector` debug windows
+never open -- no X server, Xvfb, or desktop session needed at all, works
+with `DISPLAY`/`XAUTHORITY` completely unset. Without it, all three show
+GUI windows by default and **will crash hard**
+(`cv::Exception: Can't initialize GTK backend`) if entered via
+`docker_enter_jetson.sh --headless` (§5.2) or any other session with no X
+server reachable -- always pass `--headless` in that situation.
+
+- **`detector_video_test`**: single-threaded, synchronous
+  `YOLO::detect()` over a video file. Without `--headless`, shows the
+  internal `YOLOV5` debug window (`imshow("detection", ...)`), throttled to
+  ~30fps display via `waitKey(33)`.
+  ```
+  ./build/detector_video_test --headless --config-path=configs/demo_tensorrt.yaml assets/demo/demo.avi
+  ```
+- **`mt_detector_video_test`**: exercises the async ring-buffered
+  `MultiThreadDetector::push()`/`debug_pop()` path over the same video.
+  Preloads every frame into RAM up front so video-file decode time doesn't
+  pollute the timing numbers (a real camera wouldn't pay that cost either).
+  Same invocation as above, plus its own additional flags -- see §6.2.
+- **`auto_aim_test`**: the full pipeline -- `YOLO::detect()` +
+  `Tracker::track()` + `Aimer::aim()` -- over a video **and a matching
+  ground-truth timestamp/orientation `.txt` file**. **Path is given WITHOUT
+  the `.avi` extension** (it appends `.avi`/`.txt` itself) -- differs from
+  the two binaries above, which want the full filename:
+  ```
+  ./build/auto_aim_test --headless --config-path=configs/demo_tensorrt.yaml assets/demo/demo
+  ```
+- **`mt_standard`/`mt_auto_aim_debug`**: the real, camera/gimbal-driven
+  production binaries -- never preload frames (read one at a time from a
+  live camera), no `--headless` flag (they don't show any GUI window at
+  all, `debug=false` in production configs). The `tools::Stats`
+  `[STATS]`/`[MT-THROUGHPUT]` logging (§6.3) is baked into the shared
+  `YOLOV5`/`MultiThreadDetector` code these link against too, so it
+  surfaces automatically in their own logs -- no separate test tool needed
+  to get real production timing distributions.
+
+**Also fixed while adding this:** `Detector::detect(const cv::Mat&, int)`
+(the traditional-CV full-frame scan, `--tradition`/`use_traditional`) had
+an `imshow("binary_img", ...)` that was never gated by its own `debug_`
+flag at all (unlike its sibling `show_result()` call right below it in the
+same function) -- a pre-existing bug, invisible until `--headless` had no
+X server to silently paper over it. Now properly gated.
+
+### 6.2 `mt_detector_video_test` flags
+
+- **`--sync`**: runs the same preloaded frames through the plain
+  single-threaded `YOLO::detect()` path instead of the async ring buffer --
+  same engine, same frames, no threading -- for a direct, decode-excluded,
+  apples-to-apples baseline against the async path.
+- **`--realtime`**: paces the internal `YOLOV5` debug window's display to
+  the source video's own recorded fps (`cv::VideoCapture::CAP_PROP_FPS`,
+  falls back to 30 if unreported), matching `detector_video_test`'s/
+  `auto_aim_test`'s `waitKey(30-33)` convention. Default (no flag): fully
+  unthrottled, for stress-testing max throughput -- what all the fps
+  numbers in this doc use unless stated otherwise.
+- **`--headless`**: skips **all** GUI -- no `imshow`, no `waitKey` -- and
+  constructs the detector with `debug=false` so even the internal `YOLOV5`
+  debug window never opens. No X server, no Xvfb, no desktop session of any
+  kind needed; works with `DISPLAY`/`XAUTHORITY` completely unset. This is
+  now the recommended way to benchmark over SSH -- see §6.4 for why it
+  matters far more than just being convenient.
+- **`--max-frames=N`** (note: `=`, OpenCV's `cv::CommandLineParser` doesn't
+  accept a space-separated value): caps how many frames get preloaded, to
+  reduce memory footprint. Turned out not to matter much once `--headless`
+  is used (§6.4) -- the desktop session's own memory pressure was the
+  dominant effect, not the size of the preloaded video buffer.
+
+Example, the fully headless/unthrottled stress-test invocation used to
+produce the numbers in §6.4:
+```
+ssh <jetson> "docker exec <container> bash -c 'unset DISPLAY; unset XAUTHORITY; cd /root/sp_vision_25 && ./build/mt_detector_video_test --headless --config-path=configs/demo_tensorrt.yaml assets/demo/demo.avi'"
+```
+
+### 6.3 `tools::Stats` -- per-metric running mean/stddev/outliers
+
+New utility (`tools/stats.hpp`/`.cpp`) for exactly the question "the
+per-frame numbers vary a lot -- by how much, and which frames are the
+outliers?" that eyeballing individual log lines can't answer. Welford's
+online algorithm (mean/stddev without retaining every sample). Construct
+with a name (`tools::Stats foo_stats_{"name"};`), call `.add(value_ms,
+frame_index)` once per sample -- auto-logs a `[STATS]` summary
+(count/mean/stddev/min/max + the worst-N samples, each tagged with the
+frame index that produced it) every 200 samples, and once more from the
+destructor so short runs still get a final report.
+
+Wired into:
+- **`YOLOV5`** (single-threaded, both backends): `detect total` -- wraps
+  the *entire* `detect()` call, the number that actually dictates
+  achievable FPS for this path (the per-bracket stats below are its
+  components, not a substitute). Plus the TensorRT-specific brackets: `TRT
+  memcpy`/`dispatch`/`enqueueV3`/`gpu_wait_and_d2h`, and `parse` (shared
+  with the non-TensorRT backends).
+- **`MultiThreadDetector`** (async): `MT push total (excl. backpressure)`
+  / `MT pop total` -- each side's own *active* cost, for diagnosing which
+  pipeline *stage* is inherently slower. `MT push wall (incl.
+  backpressure)` -- wraps the *entire* `push()` call including any wait for
+  a free ring slot, i.e. what a real caller (`mt_standard.cpp`'s producer
+  loop) actually pays per frame. `MT pipeline_latency` -- end-to-end delay
+  from `push(t)` to a result being ready, a *different* question from
+  throughput (how stale a result is, not how many frames/sec the pipeline
+  sustains). A derived `[MT-THROUGHPUT]` line every 200 pops logs a
+  theoretical `ceiling` (from `push_total`/`pop_total`, assumes infinite
+  ring buffering) alongside an `achieved` estimate (from `push_wall`).
+
+**Gotcha, found the hard way: `[MT-THROUGHPUT]`'s `achieved` number is not
+a precise fps predictor.** With only `kTrtRingSize=3` slots of buffering,
+the producer can burst ahead of a slower consumer without the two
+threads' costs averaging out to the fully-saturated-queue theoretical
+rate implied by `push_wall`'s mean -- measured up to ~25% off from the
+real number. **The actual ground truth for real achieved throughput is
+the simple `done: ... fps` summary line** (`popped_count / elapsed` wall
+clock), not any derived `Stats` mean -- treat `push_wall`'s stats as a
+diagnostic (where's the time going, which frames are outliers), not a
+throughput oracle.
+
+### 6.4 Performance tuning findings, in order of actual impact (measured)
+
+All numbers from repeated `mt_detector_video_test` runs (unthrottled,
+full 687-frame `assets/demo/demo.avi`) on the same code, varying only the
+device/environment state:
+
+1. **Reboot the device if it's been under heavy, repeated TensorRT/CUDA
+   engine-build churn for a long time.** Pinned/CMA memory (a small,
+   physically-contiguous carveout, separate from and in addition to
+   regular RAM) can fragment from many alloc/free cycles across many
+   processes, causing `NvMapMemAllocInternalTagged: error 12` and hard
+   crashes (`cudaMallocHost failed`, `CUDA initialization failure`). A
+   `docker restart` does **not** fix this -- the carveout is host-kernel
+   state, not container-scoped. Only a full device reboot resets it.
+   **Single biggest factor measured this session: ~100-130fps -> 183fps**,
+   same code, purely from a clean reboot.
+2. **`sudo jetson_clocks`** (§5.7) -- still real and worth doing (locks
+   GPU/CPU clocks at max, disabling DVFS ramp-down/up between bursty
+   inference calls), but measured smaller than expected *on top of* a
+   clean reboot: **~4% (183fps -> 191fps)**. Doesn't survive a reboot --
+   re-run it after every one. Don't assume it alone explains a big
+   performance gap; check the memory/reboot state first.
+3. **Close/log out of any desktop GUI session before benchmarking.** A
+   running GNOME session costs ~1-3GB RAM baseline. Combined with
+   `mt_detector_video_test`'s frame-preload design (~4.3GB for the full
+   demo video -- deliberately holding it all in memory so file-decode time
+   doesn't pollute the timing), this pushes total memory usage close
+   enough to the device's 7.6GB limit to cause real kernel-level
+   memory-pressure stalls. Confirmed via `tegrastats` run concurrently with
+   the benchmark and correlated against the worst outlier frames' exact
+   timestamps: CPU cores pegged near 100%, GPU near 97% utilization, RAM at
+   ~81% peak during those windows -- not GPU clock ramping (already ruled
+   out by clocks being locked), not thermal throttling (temps stayed a mild
+   ~57-58°C throughout). Measured: logging out cut peak RAM from ~6.2GB
+   (81%) to ~5.6GB (74%), **fps 191 -> 233**, and worst-case per-frame
+   stalls (excluding the one-time first-frame warmup) from ~30-50ms down to
+   ~7-8ms.
+4. **Best: run fully `--headless` (§6.2), no desktop or X server at all.**
+   Strictly less overhead than just logging out, which still leaves GDM's
+   login-greeter `Xorg` process and related services running. Measured:
+   **287fps**, worst-case stalls (excl. warmup) down to ~3.5-4ms -- the
+   best result measured all session, on the exact same code as the
+   100-130fps starting point. `--max-frames` (reducing the preloaded video
+   buffer itself) made no further meaningful difference once headless --
+   confirms the desktop session's overhead was the dominant effect, not the
+   video buffer's absolute size.
+
+**Caveat:** `mt_standard.cpp`/the actual production path never preloads
+hundreds of frames like this test does -- it reads one frame at a time
+from a live camera. So the specific memory-pressure mechanism above is
+very likely a benchmark-tool artifact, not something the deployed robot
+hits in the field. Still worth keeping the Jetson's desktop light (or
+better, run headless) *while benchmarking*, since jetson_clocks/reboot
+findings 1-2 apply generally, not just to this test tool.
+
+### 6.5 X11 quirk: GDM's per-session `Xauthority` (only relevant without `--headless`)
+
+If you need the internal debug `imshow` window (i.e. **not** using
+`--headless`) and hit `"Authorization required, but no authorization
+protocol specified"` after a reboot or a desktop logout/login cycle: the
+container's `.Xauthority` is bind-mounted from `~/.Xauthority` at
+container-*creation* time (see `docker_enter_jetson.sh`), but GDM manages
+its own, separate, per-session auth file at
+`/run/user/<uid>/gdm/Xauthority` (different for a logged-in desktop
+session vs. the login greeter, and regenerated fresh each session) -- the
+mounted file goes stale and the container has no way to see the new one.
+Since it's a live bind-mounted **file** (not a directory), `docker
+start`/`docker restart` doesn't refresh it even though the container
+itself survives fine. Fix without recreating the container (which would
+need an active desktop session + `$DISPLAY` anyway):
+```
+docker cp /run/user/<uid>/gdm/Xauthority <container>:/tmp/current_auth
+docker exec -e DISPLAY=:<N> -e XAUTHORITY=/tmp/current_auth <container> <cmd>
+```
+(`<uid>` is usually `1000` for a normal logged-in user, or the `gdm`
+system user's uid for the login greeter -- check `ps aux | grep Xorg` for
+the exact `-auth` path and `vt`/`DISPLAY` currently in use; the auth file
+is typically root-owned and needs `sudo cp`/`sudo chmod` to read from a
+non-root shell.) Simplest long-term fix: just use `--headless` (§6.2/6.4)
+and avoid all of this.
+
+## 7. Known gaps / things to verify on real hardware
 
 - `device: TENSORRT` (§5.7) needs `/usr/local/cuda-12.6` bind-mounted from
   the host at container run time to compile at all (`-v
@@ -577,6 +827,26 @@ observable rather than something to infer).
   SocketCAN-compatible interface is present — most Jetson carrier boards don't
   expose CAN natively (unlike the AGX Orin devkit's dev header, which requires
   extra hardware/DTS overlay setup), so you likely need a USB-CAN adapter.
+- `cmake --build . --target <name>` only rebuilds `<name>` and *its own*
+  dependencies — it does **not** rebuild sibling executables that also link
+  a shared library you changed (`auto_aim`, `tools`, etc.) but weren't
+  named. Bit this session: fixing `trt_engine.cpp` and only rebuilding
+  `detector_video_test`/`mt_detector_video_test` left `auto_aim_test` (and
+  `standard`/`mt_standard`/several others) as stale binaries that then
+  failed loudly with a TensorRT plugin-registry error, unrelated-looking to
+  the actual fix. After any change to shared/library code, prefer a full
+  `cmake --build .` (no `--target`) unless you're certain which binaries
+  are affected.
+- If you ever edit a file **directly on the Jetson** (e.g. over SSH,
+  without going through the assistant/normal local-edit flow) rather than
+  in the local checkout that then gets synced over, that edit is invisible
+  to anything that later syncs the local copy back — the next sync
+  silently reverts it. Bit this session: a user's own on-Jetson fix to
+  `mt_detector_video_test.cpp` (removing a misplaced-bounding-box `imshow`
+  call) got clobbered by a later `scp` of an unrelated local change, which
+  then reintroduced a crash under `--headless`. Pull on-device edits back
+  into the local checkout (or make them there in the first place) before
+  the next sync.
 - **What was actually verified while writing this doc:** the `Dockerfile`'s
   x86_64 path was built end-to-end on a real Docker daemon and every non-ROS2
   target compiled and linked successfully. The arm64 OpenVINO archive URL was

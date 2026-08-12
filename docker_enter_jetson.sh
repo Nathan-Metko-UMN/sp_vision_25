@@ -2,9 +2,24 @@
 # Enter (creating if needed) the sp_vision_25 dev container on a Jetson Orin,
 # with GPU access and a display connected to the Jetson's own X server.
 #
-# Usage: ./docker_enter_jetson.sh
+# Usage: ./docker_enter_jetson.sh [--headless]
 # Run from the repo root (or anywhere -- it resolves paths relative to this
 # script's own location, not the current directory).
+#
+# --headless: for a pure-SSH session with no X server reachable at all (no
+# monitor attached, no Xvfb, not even a logged-in desktop session) -- skips
+# the $DISPLAY/.Xauthority checks below entirely and, when creating a FRESH
+# container, skips wiring up X11 (DISPLAY/XAUTHORITY env, the .Xauthority
+# and /tmp/.X11-unix mounts) at all. Fine for building, running the test
+# binaries' own `--headless` modes (see JETSON_ORIN.md §6.2/6.4 --
+# mt_detector_video_test's `--headless` flag needs zero X server, works
+# with DISPLAY/XAUTHORITY completely unset), and any other CLI-only work.
+# You will NOT be able to see `cv::imshow` windows from a container created
+# this way without recreating it via a plain (non-headless) run of this
+# script from a session that does have a working display -- see
+# JETSON_ORIN.md §6.5 for a lighter-weight one-off alternative
+# (`docker exec -e DISPLAY=... -e XAUTHORITY=...`) if the container already
+# has the X11 mounts from an earlier non-headless creation.
 #
 # X11 auth uses the host's .Xauthority cookie (mounted into the container),
 # not `xhost` -- xhost grants blanket local-root access that has to be
@@ -43,17 +58,31 @@ CONTAINER_NAME="sp_vision_jetson"
 IMAGE_NAME="sp_vision_25"
 REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
-if [ -z "$DISPLAY" ]; then
-  echo "DISPLAY is not set in this shell." >&2
-  echo "If you're SSH'd in and want the window on the Jetson's own monitor" >&2
-  echo "(not this SSH session), set it explicitly first, e.g.:" >&2
-  echo "  export DISPLAY=:1" >&2
-  exit 1
-fi
+HEADLESS=0
+for arg in "$@"; do
+  case "$arg" in
+    --headless) HEADLESS=1 ;;
+    *)
+      echo "Unknown argument: $arg (only --headless is recognized)" >&2
+      exit 1
+      ;;
+  esac
+done
 
-if [ ! -f "$HOME/.Xauthority" ]; then
-  echo "Warning: $HOME/.Xauthority not found -- X11 auth may fail." >&2
-  echo "Falling back to 'xhost +local:docker' may be needed instead; see JETSON_ORIN.md." >&2
+if [ "$HEADLESS" -eq 0 ]; then
+  if [ -z "$DISPLAY" ]; then
+    echo "DISPLAY is not set in this shell." >&2
+    echo "If you're SSH'd in and want the window on the Jetson's own monitor" >&2
+    echo "(not this SSH session), set it explicitly first, e.g.:" >&2
+    echo "  export DISPLAY=:1" >&2
+    echo "Or, if you don't need any GUI window at all, use --headless instead." >&2
+    exit 1
+  fi
+
+  if [ ! -f "$HOME/.Xauthority" ]; then
+    echo "Warning: $HOME/.Xauthority not found -- X11 auth may fail." >&2
+    echo "Falling back to 'xhost +local:docker' may be needed instead; see JETSON_ORIN.md." >&2
+  fi
 fi
 
 if sudo docker ps -q -f name="^${CONTAINER_NAME}\$" | grep -q .; then
@@ -61,6 +90,17 @@ if sudo docker ps -q -f name="^${CONTAINER_NAME}\$" | grep -q .; then
 elif sudo docker ps -aq -f name="^${CONTAINER_NAME}\$" | grep -q .; then
   echo "Starting existing (stopped) container '${CONTAINER_NAME}'..."
   sudo docker start "${CONTAINER_NAME}" >/dev/null
+elif [ "$HEADLESS" -eq 1 ]; then
+  echo "Creating container '${CONTAINER_NAME}' (--headless: no X11 wiring)..."
+  sudo docker run -d --name "${CONTAINER_NAME}" \
+    --runtime nvidia \
+    --ipc=host \
+    -e NVIDIA_VISIBLE_DEVICES=all \
+    -e NVIDIA_DRIVER_CAPABILITIES=all \
+    -v "${REPO_DIR}:/root/sp_vision_25" \
+    -v /usr/local/cuda-12.6:/usr/local/cuda-12.6:ro \
+    "${IMAGE_NAME}" \
+    sleep infinity
 else
   echo "Creating container '${CONTAINER_NAME}'..."
   sudo docker run -d --name "${CONTAINER_NAME}" \
