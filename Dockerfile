@@ -264,7 +264,8 @@ RUN set -eux; \
 # the /usr/lib/wsl/lib bind mount (see note above), which isn't in the
 # dynamic linker's cache since it's not present at build time. Harmless
 # no-op on hosts where that path doesn't exist.
-ENV LD_LIBRARY_PATH=/usr/lib/wsl/lib:$LD_LIBRARY_PATH
+ENV PATH=/usr/local/cuda/bin:${PATH}
+ENV LD_LIBRARY_PATH=/usr/local/cuda/lib64:${LD_LIBRARY_PATH:-}
 
 WORKDIR /root/sp_vision_25
 COPY . .
